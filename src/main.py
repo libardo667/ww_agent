@@ -2,20 +2,20 @@
 ww_agent — WorldWeaver resident daemon
 
 Boots one or more residents and (optionally) the doula loop.
-Configuration is via environment variables.
+Configuration is via environment variables (see config/env.example).
 
 Required:
-    WW_URL          WorldWeaver server base URL (e.g. http://localhost:8000)
-    LLM_URL         OpenRouter-compatible API base URL
-    LLM_KEY         API key for the LLM provider
+    WW_INFERENCE_KEY    API key for the LLM provider (OpenRouter or compatible)
 
 Optional:
-    LLM_MODEL       Default model (default: google/gemini-flash-1.5)
-    RESIDENTS_DIR   Path to directory containing resident subdirectories
-                    (default: ./residents)
-    DOULA           Enable the doula loop ("1" / "true" to enable)
-    DOULA_MODEL     Model override for soul seeding
-    LOG_LEVEL       Logging level (default: INFO)
+    WW_SERVER_URL       WorldWeaver server base URL (default: http://localhost:8000)
+    WW_INFERENCE_URL    LLM API base URL (default: https://openrouter.ai/api/v1)
+    WW_INFERENCE_MODEL  Default model ID
+    WW_RESIDENTS_DIR    Path to directory containing resident subdirectories
+                        (default: ./residents)
+    WW_DOULA            Enable the doula loop ("1" / "true" to enable)
+    WW_DOULA_MODEL      Model override for soul seeding (defaults to WW_INFERENCE_MODEL)
+    WW_LOG_LEVEL        Logging level (default: INFO)
 """
 from __future__ import annotations
 
@@ -25,6 +25,10 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env from cwd or any parent directory
+
 from src.inference.client import InferenceClient
 from src.loops.doula import DoulaLoop
 from src.resident import Resident
@@ -32,7 +36,7 @@ from src.world.client import WorldWeaverClient
 
 
 def _configure_logging() -> None:
-    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    level = os.environ.get("WW_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -47,6 +51,8 @@ def _discover_residents(residents_dir: Path) -> list[Path]:
     """
     found = []
     for entry in sorted(residents_dir.iterdir()):
+        if entry.name.startswith("_"):
+            continue
         if entry.is_dir() and (entry / "identity" / "SOUL.md").exists():
             found.append(entry)
     return found
@@ -89,20 +95,20 @@ async def main() -> None:
     log = logging.getLogger(__name__)
 
     # -- Config --
-    ww_url       = os.environ.get("WW_URL", "http://localhost:8000")
-    llm_url      = os.environ.get("LLM_URL", "https://openrouter.ai/api/v1")
-    llm_key      = os.environ.get("LLM_KEY", "")
-    llm_model    = os.environ.get("LLM_MODEL", "google/gemini-flash-1.5")
-    residents_dir = Path(os.environ.get("RESIDENTS_DIR", "residents"))
-    doula_enabled = os.environ.get("DOULA", "").lower() in ("1", "true", "yes")
-    doula_model  = os.environ.get("DOULA_MODEL") or None
+    ww_url       = os.environ.get("WW_SERVER_URL", "http://localhost:8000")
+    llm_url      = os.environ.get("WW_INFERENCE_URL", "https://openrouter.ai/api/v1")
+    llm_key      = os.environ.get("WW_INFERENCE_KEY", "")
+    llm_model    = os.environ.get("WW_INFERENCE_MODEL", "google/gemini-3-flash-preview")
+    residents_dir = Path(os.environ.get("WW_RESIDENTS_DIR", "residents"))
+    doula_enabled = os.environ.get("WW_DOULA", "").lower() in ("1", "true", "yes")
+    doula_model  = os.environ.get("WW_DOULA_MODEL") or None
 
     if not llm_key:
-        log.error("LLM_KEY is required")
+        log.error("WW_INFERENCE_KEY is required")
         sys.exit(1)
 
     if not residents_dir.exists():
-        log.error("RESIDENTS_DIR does not exist: %s", residents_dir)
+        log.error("WW_RESIDENTS_DIR does not exist: %s", residents_dir)
         sys.exit(1)
 
     # -- Shared clients --
@@ -112,10 +118,12 @@ async def main() -> None:
     log.info("waiting for WorldWeaver at %s", ww_url)
     await ww_client.wait_for_ready(timeout_seconds=60.0)
 
-    world_id = await ww_client.get_world_id()
-    if not world_id:
-        log.error("No world ID found — is a world seeded on the server?")
-        sys.exit(1)
+    world_id: str | None = None
+    log.info("waiting for a world to be seeded...")
+    while not world_id:
+        world_id = await ww_client.get_world_id()
+        if not world_id:
+            await asyncio.sleep(10.0)
 
     log.info("world: %s", world_id)
 

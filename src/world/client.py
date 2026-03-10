@@ -88,10 +88,12 @@ def scene_to_prose(scene: SceneData, character_name: str) -> str:
     if others:
         presence_parts = []
         for p in others:
+            # Prefer role (character/player name) over name (session slug)
+            display = p.role if p.role and p.role != p.name else p.name
             if p.last_action:
-                presence_parts.append(f"{p.name} is here — {p.last_action.rstrip('.')}")
+                presence_parts.append(f"{display} is here — {p.last_action.rstrip('.')}")
             else:
-                presence_parts.append(f"{p.name} is here")
+                presence_parts.append(f"{display} is here")
         parts.append(" ".join(presence_parts) + ".")
     else:
         parts.append("No one else is here right now.")

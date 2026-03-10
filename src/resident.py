@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.identity.loader import IdentityLoader, ResidentIdentity
@@ -132,20 +132,39 @@ class Resident:
 
         if session_path.exists():
             session_id = session_path.read_text(encoding="utf-8").strip()
-            logger.debug("[%s] loaded session_id: %s", self.name, session_id)
-            return session_id
+            try:
+                await self._ww.get_scene(session_id)
+                logger.debug("[%s] resumed session: %s", self.name, session_id)
+                return session_id
+            except Exception:
+                logger.info("[%s] session %s stale — creating new session", self.name, session_id)
+                session_path.unlink(missing_ok=True)
 
-        # New session — bootstrap with the world server
-        session_id = f"{self._identity.name}-{uuid.uuid4().hex[:8]}"
+        # New session — bootstrap with the world server.
+        # Session ID uses slug-YYYYMMDD-HHMMSS so the digest endpoint can
+        # extract the character name for display ("rowan-20260310-..." → "Rowan").
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        name_slug = self._identity.name.lower()
+        session_id = f"{name_slug}-{ts}"
         identity = self._identity
+
+        # player_role format "Name — vibe" lets the server extract just the name
+        player_role = f"{identity.name} — {identity.vibe}" if identity.vibe else identity.name
+
+        entry_location_path = self._resident_dir / "identity" / "entry_location.txt"
+        entry_location = ""
+        if entry_location_path.exists():
+            entry_location = entry_location_path.read_text(encoding="utf-8").strip()
+            entry_location_path.unlink()  # consume once
 
         await self._ww.bootstrap_session(
             session_id=session_id,
             world_id=world_id,
             world_theme="",           # server uses existing world theme
-            player_role=identity.vibe or identity.name,
-            tone=identity.tuning.fast_temperature and "natural, grounded" or "natural, grounded",
+            player_role=player_role,
+            tone="natural, grounded",
             description=identity.soul[:300],
+            entry_location=entry_location,
         )
 
         session_path.write_text(session_id, encoding="utf-8")

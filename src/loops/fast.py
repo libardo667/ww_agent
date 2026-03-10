@@ -11,7 +11,7 @@ from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.working import WorkingMemory
-from src.world.client import WorldWeaverClient, scene_to_prose
+from src.world.client import WorldWeaverClient
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,20 @@ class FastLoop(BaseLoop):
         self._provisional = provisional
         self._tuning = identity.tuning
         self._last_event_ts: str = datetime.now(timezone.utc).isoformat()
+        # Fire once immediately on first boot so the agent "arrives" in the world
+        # without waiting for an external event to trigger them.
+        self._first_boot = not working_memory.has_any()
 
     # ------------------------------------------------------------------
     # Trigger: poll for new events at our location
     # ------------------------------------------------------------------
 
     async def _wait_for_trigger(self) -> None:
+        if self._first_boot:
+            self._first_boot = False
+            logger.info("[%s:fast] first boot — firing arrival action", self.name)
+            return
+
         poll_interval = min(self._tuning.fast_cooldown_seconds, 30.0)
 
         while True:
@@ -82,15 +90,12 @@ class FastLoop(BaseLoop):
 
     async def _decide_and_execute(self, context: dict) -> None:
         scene = context["scene"]
-        scene_prose = scene_to_prose(scene, self.name)
 
         # The system prompt is the character. Nothing else.
         system_prompt = self._identity.soul
 
-        # The user prompt is the world as they experience it.
-        # No instructions, no format requirements, no API vocabulary.
-        # The agent writes what they do, and we submit that text.
-        user_prompt = scene_prose
+        # The user prompt is a compact scene-check — short question, short answer.
+        user_prompt = self._build_fast_prompt(scene)
 
         response = await self._llm.complete(
             system_prompt=system_prompt,
@@ -141,6 +146,48 @@ class FastLoop(BaseLoop):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _build_fast_prompt(self, scene) -> str:
+        """
+        Scene-grounded prompt that lets the agent respond naturally —
+        thought, speech, or action — and feeds into the server's narration pipeline.
+        """
+        location = scene.location or "somewhere"
+
+        # Who's present
+        others = [p for p in scene.present if p.name.lower() != self.name.lower()]
+        if others:
+            present_lines = "\n".join(
+                f"- {p.name}" + (f" ({p.role})" if p.role and p.role != p.name else "")
+                + (f": {p.last_action}" if p.last_action else "")
+                for p in others
+            )
+        else:
+            present_lines = "(no one else)"
+
+        # Recent events at this location
+        event_lines = ""
+        if scene.recent_events_here:
+            events = scene.recent_events_here[-3:]
+            event_lines = "\n".join(f"- {e.summary}" for e in events if e.summary)
+
+        # Your own recent actions
+        recent = self._working.recent(2)
+        own_lines = ""
+        if recent:
+            own = [e.get("action", "") for e in recent if e.get("action")]
+            if own:
+                own_lines = "What you've been doing: " + " / ".join(own)
+
+        parts = [f"You're at {location}."]
+        parts.append(f"Present:\n{present_lines}")
+        if event_lines:
+            parts.append(f"Recent:\n{event_lines}")
+        if own_lines:
+            parts.append(own_lines)
+        parts.append("What do you do, say, or notice? Respond naturally and briefly.")
+
+        return "\n\n".join(parts)
 
     def _extract_impression(self, text: str) -> tuple[str, str]:
         """

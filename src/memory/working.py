@@ -31,6 +31,10 @@ class WorkingMemory:
         """Full buffer — for the slow loop."""
         return list(self._items)
 
+    def has_any(self) -> bool:
+        """True if this resident has acted before (not a first boot)."""
+        return len(self._items) > 0
+
     def save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(self._items, indent=2, ensure_ascii=False), encoding="utf-8")

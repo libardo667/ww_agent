@@ -163,7 +163,8 @@ class DoulaLoop:
             logger.debug("[doula] candidate: %s (weight=%.2f)", name, weight)
 
             # Proximity: does this name appear in any tethered agent's recent events?
-            if not await self._near_tethered_agent(name):
+            found_at = await self._near_tethered_agent(name)
+            if found_at is None:
                 logger.debug("[doula] %s not near any tethered agent, skipping", name)
                 continue
 
@@ -179,8 +180,8 @@ class DoulaLoop:
                 logger.info("[doula] daily limit hit mid-scan, stopping")
                 return
 
-            logger.info("[doula] %s: all gates open (weight=%.2f) — seeding resident", name, weight)
-            await self._seed_and_spawn(name, context_lines)
+            logger.info("[doula] %s: all gates open (weight=%.2f) at %s — seeding resident", name, weight, found_at)
+            await self._seed_and_spawn(name, context_lines, entry_location=found_at)
 
             # One spawn per scan cycle — let the world absorb it
             return
@@ -262,43 +263,79 @@ class DoulaLoop:
             logger.debug("[doula] world facts unavailable: %s", e)
             return []
 
-    @staticmethod
-    def _looks_like_name(s: str) -> bool:
-        """Rough filter: a character name starts with a capital letter, 3+ chars, no digits."""
-        return bool(s and len(s) >= 3 and re.match(r'^[A-Z][a-z]+', s) and not any(c.isdigit() for c in s))
+    # Words that indicate a place or business rather than a character name.
+    _PLACE_WORDS: frozenset[str] = frozenset({
+        "market", "shop", "store", "street", "avenue", "road", "park",
+        "cafe", "bar", "restaurant", "hotel", "plaza", "square", "station",
+        "building", "center", "centre", "district", "alley", "lane",
+    })
+
+    @classmethod
+    def _looks_like_name(cls, s: str) -> bool:
+        """Rough filter: a character name is one or two capitalized words, no hyphens, no digits,
+        and does not end in a common location word."""
+        if not s or len(s) < 3:
+            return False
+        # Must be one or two plain capitalized words (no hyphens, punctuation, digits)
+        if not re.fullmatch(r'[A-Z][a-z]+(?: [A-Z][a-z]+)?', s):
+            return False
+        # Reject if any word is a known place indicator
+        words = s.lower().split()
+        if any(w in cls._PLACE_WORDS for w in words):
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Proximity check — does this name appear near a tethered agent?
     # ------------------------------------------------------------------
 
-    async def _near_tethered_agent(self, candidate_name: str) -> bool:
+    async def _near_tethered_agent(self, candidate_name: str) -> str | None:
         """
         Check if this untethered character name appears in recent events
         from any of the known tethered sessions. If they're showing up
         in the same narrative space, they're close enough.
+
+        Returns the location where they were found, or None if not found.
+
+        NOTE: If the candidate already appears in scene.present (i.e. they have
+        an active session — a human player or already-running agent), we return None.
+        Presence in scene.present means "already active"; we only spawn agents for
+        characters mentioned in narrative events who don't have their own session.
         """
         name_lower = candidate_name.lower()
 
         for session_id in self._sessions:
             try:
-                # Get scene — check if candidate appears in present or recent events
                 scene = await self._ww.get_scene(session_id)
+
+                # If the candidate is already an active participant (has a session),
+                # do NOT spawn them — they're a live player or already-running agent.
                 for person in scene.present:
-                    if _name_similarity(person.name, candidate_name) >= _TETHER_THRESHOLD:
-                        return True
+                    role_lower = person.role.lower() if person.role else ""
+                    if (
+                        _name_similarity(person.name, candidate_name) >= _TETHER_THRESHOLD
+                        or _name_similarity(role_lower, name_lower) >= _TETHER_THRESHOLD
+                    ):
+                        logger.debug(
+                            "[doula] %s already has an active session (%s), skipping",
+                            candidate_name, person.name,
+                        )
+                        return None
+
+                # Candidate appears in narrative events near a tethered agent — eligible.
                 for event in scene.recent_events_here:
                     if name_lower in event.summary.lower() or name_lower in event.who.lower():
-                        return True
+                        return scene.location or None
             except Exception:
                 continue
 
-        return False
+        return None
 
     # ------------------------------------------------------------------
     # Seed SOUL.md and scaffold the new resident directory
     # ------------------------------------------------------------------
 
-    async def _seed_and_spawn(self, name: str, context_lines: list[str]) -> None:
+    async def _seed_and_spawn(self, name: str, context_lines: list[str], *, entry_location: str | None = None) -> None:
         # Enrich with a targeted name query — cheap, and catches anything the broad
         # discovery query missed about this specific character.
         extra_facts, extra_graph = await asyncio.gather(
@@ -339,6 +376,10 @@ class DoulaLoop:
             f"# {name}\n\n- **Spawned-By:** doula\n- **Spawned-At:** {ts}\n",
             encoding="utf-8"
         )
+
+        if entry_location:
+            (identity_dir / "entry_location.txt").write_text(entry_location, encoding="utf-8")
+            logger.info("[doula] %s will enter at: %s", name, entry_location)
 
         self._ledger.record_spawn()
         self._tethered.add(name)
