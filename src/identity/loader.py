@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class LoopTuning:
+    # fast loop
+    fast_cooldown_seconds: float = 75.0
+    fast_act_threshold: float = 0.5
+    fast_max_context_events: int = 5
+    fast_model: str | None = None
+    fast_temperature: float = 0.8
+    fast_max_tokens: int = 200
+
+    # slow loop
+    slow_impression_threshold: int = 3
+    slow_fallback_seconds: float = 360.0
+    slow_max_context_events: int = 20
+    slow_model: str | None = None
+    slow_temperature: float = 0.6
+    slow_max_tokens: int = 500
+
+    # mail loop
+    mail_enabled: bool = True
+    mail_poll_seconds: float = 600.0
+    mail_send_delay_seconds: float = 120.0
+    mail_discard_threshold: float = 0.5
+    mail_max_letter_words: int = 400
+    mail_model: str | None = None
+    mail_temperature: float = 0.5
+    mail_max_tokens: int = 600
+
+    @classmethod
+    def from_dict(cls, data: dict) -> LoopTuning:
+        fast = data.get("fast", {})
+        slow = data.get("slow", {})
+        mail = data.get("mail", {})
+        return cls(
+            fast_cooldown_seconds=fast.get("cooldown_seconds", 75.0),
+            fast_act_threshold=fast.get("act_threshold", 0.5),
+            fast_max_context_events=fast.get("max_context_events", 5),
+            fast_model=fast.get("model"),
+            fast_temperature=fast.get("temperature", 0.8),
+            fast_max_tokens=fast.get("max_tokens", 200),
+            slow_impression_threshold=slow.get("impression_threshold", 3),
+            slow_fallback_seconds=slow.get("fallback_seconds", 360.0),
+            slow_max_context_events=slow.get("max_context_events", 20),
+            slow_model=slow.get("model"),
+            slow_temperature=slow.get("temperature", 0.6),
+            slow_max_tokens=slow.get("max_tokens", 500),
+            mail_enabled=mail.get("enabled", True),
+            mail_poll_seconds=mail.get("poll_seconds", 600.0),
+            mail_send_delay_seconds=mail.get("send_delay_seconds", 120.0),
+            mail_discard_threshold=mail.get("discard_threshold", 0.5),
+            mail_max_letter_words=mail.get("max_letter_words", 400),
+            mail_model=mail.get("model"),
+            mail_temperature=mail.get("temperature", 0.5),
+            mail_max_tokens=mail.get("max_tokens", 600),
+        )
+
+
+@dataclass
+class ResidentIdentity:
+    name: str
+    soul: str          # full text of SOUL.md — goes directly into system prompt
+    vibe: str          # short phrase from IDENTITY.md
+    tuning: LoopTuning
+
+
+class IdentityLoader:
+    @staticmethod
+    def load(resident_dir: Path) -> ResidentIdentity:
+        identity_dir = resident_dir / "identity"
+
+        soul_path = identity_dir / "SOUL.md"
+        if not soul_path.exists():
+            raise FileNotFoundError(f"SOUL.md not found at {soul_path}")
+        soul = soul_path.read_text(encoding="utf-8").strip()
+
+        identity_path = identity_dir / "IDENTITY.md"
+        vibe = ""
+        if identity_path.exists():
+            for line in identity_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("- **Vibe:**"):
+                    vibe = line.split("**Vibe:**", 1)[-1].strip()
+                    break
+
+        tuning_path = identity_dir / "tuning.json"
+        if tuning_path.exists():
+            tuning = LoopTuning.from_dict(json.loads(tuning_path.read_text(encoding="utf-8")))
+        else:
+            tuning = LoopTuning()
+
+        name = resident_dir.name
+
+        return ResidentIdentity(name=name, soul=soul, vibe=vibe, tuning=tuning)
+
+    @staticmethod
+    def save_soul(resident_dir: Path, soul_text: str) -> None:
+        """Slow loop calls this when SOUL.md evolves."""
+        soul_path = resident_dir / "identity" / "SOUL.md"
+        soul_path.write_text(soul_text, encoding="utf-8")
