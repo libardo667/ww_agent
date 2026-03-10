@@ -20,6 +20,7 @@ class LoopTuning:
     slow_fallback_seconds: float = 360.0
     slow_max_context_events: int = 20
     slow_model: str | None = None
+    slow_subconscious_model: str | None = None   # cheaper model for the extractive pass
     slow_temperature: float = 0.6
     slow_max_tokens: int = 500
 
@@ -49,6 +50,7 @@ class LoopTuning:
             slow_fallback_seconds=slow.get("fallback_seconds", 360.0),
             slow_max_context_events=slow.get("max_context_events", 20),
             slow_model=slow.get("model"),
+            slow_subconscious_model=slow.get("subconscious_model"),
             slow_temperature=slow.get("temperature", 0.6),
             slow_max_tokens=slow.get("max_tokens", 500),
             mail_enabled=mail.get("enabled", True),

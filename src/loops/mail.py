@@ -18,14 +18,29 @@ _RE_SEND    = re.compile(r'\[SEND:\s*(.+?)\]', re.IGNORECASE)
 _RE_HOLD    = re.compile(r'\[HOLD:\s*(.+?)\]', re.IGNORECASE)
 _RE_DISCARD = re.compile(r'\[DISCARD:\s*(.+?)\]', re.IGNORECASE)
 
+# Cancellation heuristic for intent responses.
+# The agent can decline by saying nothing substantial, or using withdrawal language.
+_CANCEL_WORDS = re.compile(
+    r'\b(nothing|never mind|nevermind|not now|let it go|forget it|no|pass|skip|'
+    r'actually|on second thought|maybe not|leave it)\b',
+    re.IGNORECASE,
+)
+_LETTER_MIN_WORDS = 20  # fewer than this = treat as a non-response / cancellation
+
 
 class MailLoop(BaseLoop):
     """
-    Correspondence loop. Fires when the inbox has letters or drafts are staged.
+    Correspondence loop. Fires when the inbox has letters, staged drafts, or
+    letter intents queued by the slow loop.
 
     The agent receives their correspondence as prose — letters as they'd
-    read them, drafts as they'd re-read them before sending. They respond
-    naturally. Light bracketed tags let the framework act on their decisions.
+    read them, drafts as they'd re-read them before sending. Intents arrive
+    as a gentle question: something has been on their mind, do they want to
+    put it in a letter?
+
+    The agent responds naturally. Light bracketed tags let the framework act
+    on their decisions for inbox/drafts. For intents, the response itself is
+    the letter — or a quiet cancellation.
 
     This loop has no access to world actions or soul editing.
     Capability is enforced by what it has — not by rules in a prompt.
@@ -49,11 +64,13 @@ class MailLoop(BaseLoop):
         self._sent_dir = resident_dir / "letters" / "drafts" / "sent"
         self._inbox_dir = resident_dir / "letters" / "inbox"
         self._read_dir = resident_dir / "letters" / "inbox" / "read"
-        for d in [self._drafts_dir, self._sent_dir, self._inbox_dir, self._read_dir]:
+        self._intents_dir = resident_dir / "letters" / "intents"
+        for d in [self._drafts_dir, self._sent_dir, self._inbox_dir,
+                  self._read_dir, self._intents_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Trigger: inbox has items OR staged drafts exist
+    # Trigger: inbox has items, staged drafts exist, or intents are queued
     # ------------------------------------------------------------------
 
     async def _wait_for_trigger(self) -> None:
@@ -72,8 +89,14 @@ class MailLoop(BaseLoop):
             pass
 
         # Check local staged drafts
-        drafts = list(self._drafts_dir.glob("draft_*.md"))
-        return len(drafts) > 0
+        if list(self._drafts_dir.glob("draft_*.md")):
+            return True
+
+        # Check intents staged by the slow loop
+        if list(self._intents_dir.glob("intent_*.md")):
+            return True
+
+        return False
 
     async def _gather_context(self) -> dict:
         letters: list[Letter] = []
@@ -83,11 +106,12 @@ class MailLoop(BaseLoop):
             logger.debug("[%s:mail] inbox fetch failed: %s", self.name, e)
 
         drafts = list(self._drafts_dir.glob("draft_*.md"))
+        intents = list(self._intents_dir.glob("intent_*.md"))
 
-        return {"letters": letters, "drafts": drafts}
+        return {"letters": letters, "drafts": drafts, "intents": intents}
 
     async def _should_act(self, context: dict) -> bool:
-        return bool(context["letters"] or context["drafts"])
+        return bool(context["letters"] or context["drafts"] or context["intents"])
 
     # ------------------------------------------------------------------
     # Decide and execute
@@ -96,6 +120,16 @@ class MailLoop(BaseLoop):
     async def _decide_and_execute(self, context: dict) -> None:
         letters: list[Letter] = context["letters"]
         draft_paths: list[Path] = context["drafts"]
+        intent_paths: list[Path] = context["intents"]
+
+        # Intents are handled one at a time — each gets its own focused exchange.
+        # We process them before inbox/drafts so the agent isn't context-saturated.
+        for intent_path in intent_paths:
+            try:
+                content = intent_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            await self._process_intent(intent_path, content)
 
         if not letters and not draft_paths:
             return
@@ -114,7 +148,6 @@ class MailLoop(BaseLoop):
         if letters:
             prompt_parts.append("You have letters:")
             for letter in letters:
-                # Extract sender name from filename convention
                 sender = self._parse_sender(letter.filename)
                 body = letter.body.strip()
                 prompt_parts.append(f"\nFrom {sender}:\n{body}")
@@ -122,7 +155,6 @@ class MailLoop(BaseLoop):
         if drafts:
             prompt_parts.append("\nYou have unsent letters you wrote earlier:")
             for path, content in drafts:
-                # Parse recipient from draft content
                 recipient = self._parse_draft_recipient(content)
                 body = self._parse_draft_body(content)
                 prompt_parts.append(f"\nTo {recipient}:\n{body}")
@@ -136,7 +168,6 @@ class MailLoop(BaseLoop):
             "To discard: [DISCARD: recipient name]"
         )
 
-        # System prompt: just the personality paragraph — no full soul needed for correspondence
         system_prompt = self._extract_personality(self._identity.soul)
         user_prompt = "\n".join(prompt_parts)
 
@@ -150,6 +181,70 @@ class MailLoop(BaseLoop):
 
         await self._process_mail_response(response, letters, drafts)
 
+    # ------------------------------------------------------------------
+    # Intent handling — ask the agent, send or discard
+    # ------------------------------------------------------------------
+
+    async def _process_intent(self, intent_path: Path, content: str) -> None:
+        """
+        Present a slow-loop intent to the agent as a gentle question.
+        If they write something substantial, send it. If they demur, discard the intent.
+        """
+        recipient = self._parse_draft_recipient(content)
+        context_excerpt = self._parse_intent_context(content)
+
+        # Frame the question naturally — slightly formal, like a moment of pause,
+        # but clearly an invitation rather than a command.
+        # The agent can write a letter or simply decline.
+        if context_excerpt:
+            user_prompt = (
+                f"{context_excerpt}\n\n"
+                f"Is there something you'd like to say to {recipient}? "
+                f"If so, write it here. If not, just say so."
+            )
+        else:
+            user_prompt = (
+                f"{recipient} has been on your mind.\n\n"
+                f"Is there something you'd like to say to them? "
+                f"If so, write it here. If not, just say so."
+            )
+
+        system_prompt = self._extract_personality(self._identity.soul)
+
+        response = await self._llm.complete(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=self._tuning.mail_model,
+            temperature=self._tuning.mail_temperature,
+            max_tokens=self._tuning.mail_max_tokens,
+        )
+
+        response = response.strip()
+
+        # Cancellation: short response, or explicit withdrawal language
+        word_count = len(response.split())
+        if word_count < _LETTER_MIN_WORDS or _CANCEL_WORDS.search(response):
+            intent_path.unlink(missing_ok=True)
+            logger.info("[%s:mail] intent for %s declined (%d words)", self.name, recipient, word_count)
+            return
+
+        # Substantial response — send it as a letter
+        try:
+            await self._ww.send_letter(
+                from_name=self.name,
+                to_agent=recipient,
+                body=response,
+                session_id=self._session_id,
+            )
+            intent_path.unlink(missing_ok=True)
+            logger.info("[%s:mail] sent letter to %s from intent", self.name, recipient)
+        except Exception as e:
+            logger.warning("[%s:mail] send to %s failed: %s", self.name, recipient, e)
+
+    # ------------------------------------------------------------------
+    # Inbox / draft response processing
+    # ------------------------------------------------------------------
+
     async def _process_mail_response(
         self,
         response: str,
@@ -161,7 +256,6 @@ class MailLoop(BaseLoop):
             sender_name = match.group(1).strip()
             reply_body = match.group(2).strip()
 
-            # Find the session ID to reply to from the letter body
             to_session = self._find_reply_session(sender_name, letters)
             if to_session:
                 try:
@@ -222,7 +316,6 @@ class MailLoop(BaseLoop):
 
     def _parse_draft_body(self, content: str) -> str:
         lines = content.splitlines()
-        # Skip header lines (To:, Staged-At:, blank line)
         in_body = False
         body_lines = []
         for line in lines:
@@ -231,6 +324,18 @@ class MailLoop(BaseLoop):
             elif line.strip() == "":
                 in_body = True
         return "\n".join(body_lines).strip()
+
+    def _parse_intent_context(self, content: str) -> str:
+        """Extract the context excerpt from an intent file."""
+        lines = content.splitlines()
+        in_context = False
+        context_lines = []
+        for line in lines:
+            if in_context:
+                context_lines.append(line)
+            elif line.strip() == "Context:":
+                in_context = True
+        return "\n".join(context_lines).strip()
 
     def _find_reply_session(self, sender_name: str, letters: list[Letter]) -> str | None:
         """Look for Reply-To-Session header in the letter from this sender."""
@@ -247,7 +352,6 @@ class MailLoop(BaseLoop):
         The full soul is more than needed for correspondence triage.
         Falls back to the full soul if no paragraph structure is found.
         """
-        # Look for the ## Personality section
         match = re.search(r'## Personality\s+(.+?)(?=\n##|\Z)', soul, re.DOTALL)
         if match:
             return match.group(1).strip()
