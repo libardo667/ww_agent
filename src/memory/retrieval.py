@@ -42,30 +42,45 @@ class LongTermMemory:
     v3: Embedding-based semantic search. Best relevance, requires embedding API
     or local model.
 
-    ## Possible v4: WorldWeaver-native retrieval
+    ## v4: WorldWeaver-native retrieval — already built, just needs wiring
 
-    WorldWeaver's server already runs an intent/validate/narrate pipeline with
-    semantic understanding of the world state. This might be leverageable for
-    memory retrieval — the server knows what things *mean* in world context, not
-    just which tags match.
+    WorldWeaver already uses `openai/text-embedding-3-small` (via OpenRouter)
+    to embed world events and facts into a semantic graph. Two HTTP endpoints
+    expose this directly:
 
-    Possible approaches:
-    - A dedicated `/api/world/memory/relevant?context=...` endpoint that takes
-      the current scene description and returns relevant memory hooks. The server
-      could use its existing world fact graph to surface memories the character
-      would plausibly recall given where they are and who's present.
-    - Piggybacking on the intent parser: pass the current scene as an "intent"
-      and let the server's semantic layer identify which stored facts are active.
-    - Using the narration model's context window directly: instead of retrieval,
-      give the slow loop access to a server-side "what does {name} know about
-      {location}/{character}?" query endpoint.
+        GET /api/world/facts?query=<text>&session_id=<id>&limit=<N>
+            Semantic search over world event history (WorldEvent.embedding)
 
-    This would make retrieval world-aware rather than text-aware — a memory
-    about Casper surfaces not because it mentions his name but because the world
-    model knows he's present and has prior history with this character.
+        GET /api/world/graph/facts?query=<text>&session_id=<id>&limit=<N>
+            Semantic search over active world fact graph (WorldFact.embedding)
 
-    Pin: discuss with WorldWeaver server team before implementing v3. May be
-    able to skip embeddings entirely and go straight to world-native retrieval.
+    Both embed the query text and rank results by cosine similarity. The server
+    also computes a blended world context vector (recent events, weighted by
+    permanence) used for storylet selection — the same signal could inform
+    which agent memories are currently active.
+
+    **Two distinct retrieval problems:**
+
+    1. World knowledge (shared): use the existing /api/world/* endpoints.
+       The agent asks "what does the world know about [current context]?" and
+       gets back semantically relevant facts and events. No extra embedding cost
+       — the server already embeds everything.
+
+    2. Personal memories (character-specific): the long-term memory files in
+       this class. These need their own embedding. Options:
+       a. Call the same OpenRouter embedding API directly from the agent
+          (model: openai/text-embedding-3-small, add embed_text() to inference/)
+       b. Add a thin server endpoint that embeds arbitrary text and returns the
+          vector — reuses the server's already-configured embedding client.
+       c. Stay with tag matching (v1) for personal memories and use the world
+          endpoints for world knowledge. Probably good enough for now.
+
+    **Recommended upgrade path:**
+    - Wire up world fact retrieval via WorldWeaverClient (free, already exists)
+    - Embed personal memories locally using same OpenRouter model when corpus
+      grows beyond ~50 entries and tag matching degrades
+    - Skip v2/v3 entirely — jump from v1 tags to OpenRouter embeddings when
+      the signal matters enough to justify the cost (~$0.00002 per memory)
     """
 
     def __init__(self, memory_dir: Path):
