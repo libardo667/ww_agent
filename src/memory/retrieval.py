@@ -31,6 +31,41 @@ class LongTermMemory:
     Curated memories persisted by the slow loop.
     Retrieved via tag matching — v1 implementation, no embeddings needed yet.
     Content is always written in the character's voice for direct use in prompts.
+
+    ## Retrieval Upgrade Path
+
+    v1 (current): keyword/tag matching. Fast, zero dependencies, good enough
+    for a small memory corpus.
+
+    v2: TF-IDF over memory content. Better relevance, still no external calls.
+
+    v3: Embedding-based semantic search. Best relevance, requires embedding API
+    or local model.
+
+    ## Possible v4: WorldWeaver-native retrieval
+
+    WorldWeaver's server already runs an intent/validate/narrate pipeline with
+    semantic understanding of the world state. This might be leverageable for
+    memory retrieval — the server knows what things *mean* in world context, not
+    just which tags match.
+
+    Possible approaches:
+    - A dedicated `/api/world/memory/relevant?context=...` endpoint that takes
+      the current scene description and returns relevant memory hooks. The server
+      could use its existing world fact graph to surface memories the character
+      would plausibly recall given where they are and who's present.
+    - Piggybacking on the intent parser: pass the current scene as an "intent"
+      and let the server's semantic layer identify which stored facts are active.
+    - Using the narration model's context window directly: instead of retrieval,
+      give the slow loop access to a server-side "what does {name} know about
+      {location}/{character}?" query endpoint.
+
+    This would make retrieval world-aware rather than text-aware — a memory
+    about Casper surfaces not because it mentions his name but because the world
+    model knows he's present and has prior history with this character.
+
+    Pin: discuss with WorldWeaver server team before implementing v3. May be
+    able to skip embeddings entirely and go straight to world-native retrieval.
     """
 
     def __init__(self, memory_dir: Path):
