@@ -8,8 +8,10 @@ from pathlib import Path
 from src.identity.loader import IdentityLoader, ResidentIdentity
 from src.inference.client import InferenceClient
 from src.loops.fast import FastLoop
+from src.loops.ground import GroundLoop
 from src.loops.mail import MailLoop
 from src.loops.slow import SlowLoop
+from src.loops.wander import WanderLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.retrieval import LongTermMemory
 from src.memory.working import WorkingMemory
@@ -79,7 +81,9 @@ class Resident:
             self._resident_dir / "memory" / "working.json",
             max_items=identity.tuning.slow_max_context_events,
         )
-        provisional = ProvisionalScratchpad(self._resident_dir / "memory" / "impressions")
+        provisional = ProvisionalScratchpad(
+            self._resident_dir / "memory" / "impressions"
+        )
         long_term = LongTermMemory(self._resident_dir / "memory" / "long_term.json")
 
         fast = FastLoop(
@@ -104,6 +108,28 @@ class Resident:
         )
 
         loops: list[asyncio.Coroutine] = [fast.run(), slow.run()]
+
+        if identity.tuning.wander_enabled:
+            wander = WanderLoop(
+                identity=identity,
+                resident_dir=self._resident_dir,
+                ww_client=self._ww,
+                llm=self._llm,
+                session_id=session_id,
+                working_memory=working,
+            )
+            loops.append(wander.run())
+
+        if identity.tuning.ground_enabled:
+            ground = GroundLoop(
+                identity=identity,
+                resident_dir=self._resident_dir,
+                ww_client=self._ww,
+                llm=self._llm,
+                session_id=session_id,
+                working_memory=working,
+            )
+            loops.append(ground.run())
 
         if identity.tuning.mail_enabled:
             mail = MailLoop(
@@ -137,7 +163,11 @@ class Resident:
                 logger.debug("[%s] resumed session: %s", self.name, session_id)
                 return session_id
             except Exception:
-                logger.info("[%s] session %s stale — creating new session", self.name, session_id)
+                logger.info(
+                    "[%s] session %s stale — creating new session",
+                    self.name,
+                    session_id,
+                )
                 session_path.unlink(missing_ok=True)
 
         # New session — bootstrap with the world server.
@@ -149,7 +179,9 @@ class Resident:
         identity = self._identity
 
         # player_role format "Name — vibe" lets the server extract just the name
-        player_role = f"{identity.name} — {identity.vibe}" if identity.vibe else identity.name
+        player_role = (
+            f"{identity.name} — {identity.vibe}" if identity.vibe else identity.name
+        )
 
         entry_location_path = self._resident_dir / "identity" / "entry_location.txt"
         entry_location = ""
@@ -160,7 +192,7 @@ class Resident:
         await self._ww.bootstrap_session(
             session_id=session_id,
             world_id=world_id,
-            world_theme="",           # server uses existing world theme
+            world_theme="",  # server uses existing world theme
             player_role=player_role,
             tone="natural, grounded",
             description=identity.soul[:300],
