@@ -1,6 +1,12 @@
 {
+  "wander": {
+    "enabled": true,
+    "seconds": 480,
+    "temperature": 0.8
+  },
   "fast": {
     "cooldown_seconds": 90,
+    "proactive_seconds": 180,
     "max_tokens": 250,
     "temperature": 0.75
   },

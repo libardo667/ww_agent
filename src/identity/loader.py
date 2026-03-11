@@ -9,6 +9,7 @@ from pathlib import Path
 class LoopTuning:
     # fast loop
     fast_cooldown_seconds: float = 75.0
+    fast_proactive_seconds: float = 180.0
     fast_act_threshold: float = 0.5
     fast_max_context_events: int = 5
     fast_model: str | None = None
@@ -18,11 +19,23 @@ class LoopTuning:
     # slow loop
     slow_impression_threshold: int = 3
     slow_fallback_seconds: float = 360.0
+    slow_refractory_seconds: float = 240.0   # min gap between firings
     slow_max_context_events: int = 20
     slow_model: str | None = None
     slow_subconscious_model: str | None = None   # cheaper model for the extractive pass
     slow_temperature: float = 0.6
     slow_max_tokens: int = 500
+    soul_collapse_at_notes: int = 8   # collapse SOUL.md after this many accumulated notes
+
+    # wander loop
+    wander_enabled: bool = False
+    wander_seconds: float = 600.0
+    wander_temperature: float = 0.9
+
+    # ground loop
+    ground_enabled: bool = True
+    ground_minutes: float = 35.0
+    ground_temperature: float = 0.85
 
     # mail loop
     mail_enabled: bool = True
@@ -41,6 +54,7 @@ class LoopTuning:
         mail = data.get("mail", {})
         return cls(
             fast_cooldown_seconds=fast.get("cooldown_seconds", 75.0),
+            fast_proactive_seconds=fast.get("proactive_seconds", 180.0),
             fast_act_threshold=fast.get("act_threshold", 0.5),
             fast_max_context_events=fast.get("max_context_events", 5),
             fast_model=fast.get("model"),
@@ -48,11 +62,19 @@ class LoopTuning:
             fast_max_tokens=fast.get("max_tokens", 200),
             slow_impression_threshold=slow.get("impression_threshold", 3),
             slow_fallback_seconds=slow.get("fallback_seconds", 360.0),
+            slow_refractory_seconds=slow.get("refractory_seconds", 240.0),
             slow_max_context_events=slow.get("max_context_events", 20),
             slow_model=slow.get("model"),
             slow_subconscious_model=slow.get("subconscious_model"),
             slow_temperature=slow.get("temperature", 0.6),
             slow_max_tokens=slow.get("max_tokens", 500),
+            soul_collapse_at_notes=slow.get("collapse_at_notes", 8),
+            wander_enabled=data.get("wander", {}).get("enabled", False),
+            wander_seconds=data.get("wander", {}).get("seconds", 600.0),
+            wander_temperature=data.get("wander", {}).get("temperature", 0.9),
+            ground_enabled=data.get("ground", {}).get("enabled", True),
+            ground_minutes=data.get("ground", {}).get("minutes", 35.0),
+            ground_temperature=data.get("ground", {}).get("temperature", 0.85),
             mail_enabled=mail.get("enabled", True),
             mail_poll_seconds=mail.get("poll_seconds", 600.0),
             mail_send_delay_seconds=mail.get("send_delay_seconds", 120.0),
