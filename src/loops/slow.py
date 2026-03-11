@@ -17,6 +17,16 @@ from src.world.client import WorldWeaverClient, world_facts_to_prose
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Satiation: topics the agent has already reflected on heavily this session.
+# Key = normalized topic string (person name or location slug).
+# Value = count of slow loop firings that included this topic.
+# When a topic exceeds SATIATION_THRESHOLD, impressions dominated by that
+# topic are skipped in the next pass to break the feedback spiral.
+# ---------------------------------------------------------------------------
+SATIATION_THRESHOLD = 3   # reflections on same topic before cooling down
+SATIATION_DECAY = 2       # decrement satiation score each firing (to allow re-emergence)
+
 # The slow loop has no world action client — capability enforced structurally.
 # It can stage letter drafts and note soul shifts. That's the extent of its reach.
 
@@ -95,6 +105,11 @@ class SlowLoop(BaseLoop):
         self._decisions_dir = resident_dir / "decisions"
         self._decisions_dir.mkdir(parents=True, exist_ok=True)
         self._decision_count = len(list(self._decisions_dir.glob("decision_*.json")))
+        # Refractory: timestamp of the last slow loop firing.
+        # Prevents rapid re-firing even when impressions pile up immediately after.
+        self._last_fire_ts: float = 0.0
+        # Satiation: per-topic reflection counts. Decremented each firing.
+        self._satiation: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Trigger: impression threshold OR fallback timer
@@ -102,6 +117,10 @@ class SlowLoop(BaseLoop):
 
     async def _wait_for_trigger(self) -> None:
         fallback = self._tuning.slow_fallback_seconds
+        # Refractory: minimum gap between slow loop firings.
+        # Prevents a fresh batch of impressions from immediately re-triggering
+        # after a firing — the core mechanism that breaks narrative spirals.
+        refractory_seconds = getattr(self._tuning, "slow_refractory_seconds", 240.0)
         poll_interval = 15.0
         elapsed = 0.0
 
@@ -110,7 +129,17 @@ class SlowLoop(BaseLoop):
             elapsed += poll_interval
             pending = self._provisional.pending_impressions()
             if len(pending) >= self._tuning.slow_impression_threshold:
-                return
+                # Respect refractory period even when threshold is met
+                import time
+                since_last = time.monotonic() - self._last_fire_ts
+                if since_last >= refractory_seconds:
+                    return
+                else:
+                    remaining = refractory_seconds - since_last
+                    logger.debug(
+                        "[%s:slow] impression threshold met but refractory active (%.0fs left)",
+                        self.name, remaining,
+                    )
 
         logger.debug("[%s:slow] fallback timer fired", self.name)
 
@@ -128,6 +157,10 @@ class SlowLoop(BaseLoop):
             people.extend(imp.colocated)
         query_text = " ".join(filter(None, set(locations) | set(people)))
 
+        # Apply satiation filter: skip impressions whose topics have been
+        # over-represented in recent slow loop firings.
+        pending = self._apply_satiation(pending)
+
         world_facts = []
         if query_text:
             try:
@@ -139,11 +172,24 @@ class SlowLoop(BaseLoop):
             list(filter(None, set(locations) | set(people))), limit=5
         )
 
+        # Geographic context: ground the agent's reflection in real city geography.
+        # Use the most recent location we have a record of.
+        map_context = ""
+        current_location = locations[-1] if locations else ""
+        if current_location:
+            try:
+                map_context = await self._ww.get_location_map_context(
+                    self._session_id, current_location
+                )
+            except Exception as e:
+                logger.debug("[%s:slow] map context unavailable: %s", self.name, e)
+
         return {
             "pending": pending,
             "recent": recent,
             "world_facts": world_facts,
             "long_term": long_term,
+            "map_context": map_context,
         }
 
     async def _should_act(self, context: dict) -> bool:
@@ -154,12 +200,25 @@ class SlowLoop(BaseLoop):
     # ------------------------------------------------------------------
 
     async def _decide_and_execute(self, context: dict) -> None:
+        import time
+        self._last_fire_ts = time.monotonic()  # record firing for refractory
+
         pending = context["pending"]
         recent = context["recent"]
         world_facts = context["world_facts"]
         long_term = context["long_term"]
+        map_context: str = context.get("map_context", "")
+
+        # Update satiation counts for topics appearing in this firing
+        self._update_satiation(pending)
 
         prompt_parts: list[str] = []
+
+        # Geographic grounding — city bones before the character's inner world.
+        # Presented as contextual fact, not instruction. The character doesn't need
+        # to "use" it — it just sits in their awareness the way real knowledge does.
+        if map_context:
+            prompt_parts.append(map_context)
 
         # What the fast loop has been doing — presented as their own recent history
         if recent:
@@ -258,8 +317,10 @@ class SlowLoop(BaseLoop):
 
         # Append a soul note if a shift was sensed
         if soul_note:
-            self._record_soul_note(soul_note, now)
-            logger.info("[%s:slow] soul note: %s", self.name, soul_note)
+            written = self._record_soul_note(soul_note, now)
+            if written:
+                logger.info("[%s:slow] soul note: %s", self.name, soul_note)
+                await self._maybe_collapse_soul()
 
         # Decision log — records both the reflection and what the subconscious read into it
         self._decision_count += 1
@@ -284,6 +345,77 @@ class SlowLoop(BaseLoop):
                 if isinstance(e, dict) and e.get("location")
             })
             self._long_term.store(reflection[:400], tags=tags, source="slow_reflection")
+
+    # ------------------------------------------------------------------
+    # Satiation: break feedback spirals on repeated topics
+    # ------------------------------------------------------------------
+
+    def _topic_key(self, text: str) -> str:
+        """Normalize a name/location to a satiation key."""
+        return text.lower().strip()
+
+    def _apply_satiation(self, pending: list) -> list:
+        """
+        Filter pending impressions to reduce dominance of over-represented topics.
+        If a topic (person or location) has already been reflected on SATIATION_THRESHOLD
+        times without enough time passing, skip impressions where it's the *only* topic.
+
+        We never remove ALL impressions — always let at least one through. The agent
+        shouldn't go completely blank; they should just range more widely.
+        """
+        if not pending:
+            return pending
+
+        filtered = []
+        skipped = 0
+        for imp in pending:
+            topics = [self._topic_key(p) for p in imp.colocated]
+            if imp.location:
+                topics.append(self._topic_key(imp.location))
+
+            # Check if any topic is sated
+            sated_topics = [t for t in topics if self._satiation.get(t, 0) >= SATIATION_THRESHOLD]
+            if sated_topics and len(topics) <= 2 and topics and all(
+                self._satiation.get(t, 0) >= SATIATION_THRESHOLD for t in topics
+            ):
+                skipped += 1
+                continue  # skip this impression — it's entirely dominated by sated topics
+            filtered.append(imp)
+
+        # Always keep at least one impression even if everything is sated
+        if not filtered and pending:
+            filtered = [pending[0]]
+            skipped -= 1
+
+        if skipped > 0:
+            logger.debug(
+                "[%s:slow] satiation filtered %d/%d impressions",
+                self.name, skipped, len(pending),
+            )
+        return filtered
+
+    def _update_satiation(self, pending: list) -> None:
+        """Increment satiation for topics in the current firing; decay all others."""
+        active_topics: set[str] = set()
+        for imp in pending:
+            for p in imp.colocated:
+                active_topics.add(self._topic_key(p))
+            if imp.location:
+                active_topics.add(self._topic_key(imp.location))
+
+        # Increment topics appearing in this firing
+        for topic in active_topics:
+            self._satiation[topic] = self._satiation.get(topic, 0) + 1
+
+        # Decay all topics not in this firing (they fade with time)
+        for topic in list(self._satiation.keys()):
+            if topic not in active_topics:
+                self._satiation[topic] = max(0, self._satiation[topic] - SATIATION_DECAY)
+                if self._satiation[topic] == 0:
+                    del self._satiation[topic]
+
+        if self._satiation:
+            logger.debug("[%s:slow] satiation state: %s", self.name, self._satiation)
 
     # ------------------------------------------------------------------
     # NL pattern matching on subconscious output
@@ -351,19 +483,103 @@ class SlowLoop(BaseLoop):
             encoding="utf-8"
         )
 
-    def _record_soul_note(self, note: str, ts: str) -> None:
+    def _record_soul_note(self, note: str, ts: str) -> bool:
         """
-        Append a soul note to SOUL.md rather than rewriting it wholesale.
-        The character earns small edits through accumulated experience.
-        The operator can periodically integrate notes into the main text.
+        Append a soul note to SOUL.md.
+
+        Quality filter: skip notes that are too short or are just bare markdown
+        headers with no real content (a common subconscious output artifact).
+        Returns True if the note was written, False if it was dropped.
         """
+        note = note.strip()
+        # Drop empty or very short fragments
+        if len(note) < 40:
+            logger.debug("[%s:slow] dropping short soul note: %r", self.name, note[:60])
+            return False
+        # Drop notes that are purely a markdown header (no sentence content)
+        # e.g. "**Shift in Persona:**" or "**Observations on their shift:**"
+        stripped = re.sub(r'\*+', '', note).strip(" :")
+        if len(stripped) < 30:
+            logger.debug("[%s:slow] dropping header-only soul note: %r", self.name, note[:60])
+            return False
+
         soul_path = self.resident_dir / "identity" / "SOUL.md"
         if soul_path.exists():
             current = soul_path.read_text(encoding="utf-8")
             soul_path.write_text(
                 current + f"\n\n---\n*{ts[:10]}:* {note}",
-                encoding="utf-8"
+                encoding="utf-8",
             )
+            return True
+        return False
+
+    async def _maybe_collapse_soul(self) -> None:
+        """
+        If enough soul notes have accumulated, synthesize them into a clean
+        unified SOUL.md. This prevents the character document from growing
+        into an incoherent pile of repetitive annotations.
+
+        Collapse: one LLM call reads the full document and rewrites it as clean
+        integrated prose. The result replaces the on-disk file and updates the
+        running agent's system prompt so the change takes effect immediately.
+        """
+        soul_path = self.resident_dir / "identity" / "SOUL.md"
+        if not soul_path.exists():
+            return
+
+        text = soul_path.read_text(encoding="utf-8")
+        note_count = text.count("\n---\n")
+        threshold = self._tuning.soul_collapse_at_notes
+
+        if note_count < threshold:
+            return
+
+        logger.info(
+            "[%s:slow] soul collapse triggered: %d notes accumulated (threshold %d)",
+            self.name, note_count, threshold,
+        )
+
+        system = (
+            "You are integrating a character's accumulated experiences back into their core identity. "
+            "The document has a main character description followed by dated notes about how they've evolved. "
+            "Rewrite the entire document as clean, unified prose that naturally integrates the genuine evolution. "
+            "Preserve the character's voice and format. Discard notes that are repetitive, trivial, or incomplete. "
+            "The goal: a character document that reads as naturally as the original, but reflects who they've become. "
+            "Output only the rewritten document — no preamble, no explanation. "
+            "Preserve any footer line about SOUL.md evolving."
+        )
+        user = (
+            "Current SOUL.md (original + accumulated notes):\n\n"
+            + text[:4000]
+            + "\n\nRewrite this as a single clean character document. "
+            "Keep approximately the same length as the original section (before the notes began). "
+            "Integrate the genuine character evolution naturally into the prose."
+        )
+
+        try:
+            refined = await self._llm.complete(
+                system_prompt=system,
+                user_prompt=user,
+                model=self._tuning.slow_subconscious_model or self._tuning.slow_model,
+                temperature=0.4,
+                max_tokens=700,
+            )
+        except Exception as e:
+            logger.warning("[%s:slow] soul collapse LLM call failed: %s", self.name, e)
+            return
+
+        refined = refined.strip()
+        if len(refined) < 100:
+            logger.warning("[%s:slow] soul collapse returned suspiciously short output, skipping")
+            return
+
+        soul_path.write_text(refined, encoding="utf-8")
+        # Update the running agent's system prompt immediately — next LLM call uses the refined soul
+        self._identity.soul = refined
+        logger.info(
+            "[%s:slow] soul collapsed: %d → %d chars",
+            self.name, len(text), len(refined),
+        )
 
     async def _cooldown(self) -> None:
         await asyncio.sleep(5.0)

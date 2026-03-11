@@ -11,7 +11,7 @@ from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.working import WorkingMemory
-from src.world.client import WorldWeaverClient
+from src.world.client import WorldWeaverClient, ChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ class FastLoop(BaseLoop):
         self._provisional = provisional
         self._tuning = identity.tuning
         self._last_event_ts: str = datetime.now(timezone.utc).isoformat()
+        self._last_chat_ts: str = datetime.now(timezone.utc).isoformat()
         # Fire once immediately on first boot so the agent "arrives" in the world
         # without waiting for an external event to trigger them.
         self._first_boot = not working_memory.has_any()
@@ -61,9 +62,14 @@ class FastLoop(BaseLoop):
             return
 
         poll_interval = min(self._tuning.fast_cooldown_seconds, 30.0)
+        # Proactive fallback: act on a timer even if nothing happens nearby.
+        # This keeps the agent alive in a quiet world rather than waiting indefinitely.
+        proactive_seconds = self._tuning.fast_proactive_seconds
+        elapsed = 0.0
 
         while True:
             await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
             try:
                 events = await self._ww.get_new_events(self._session_id, since=self._last_event_ts)
                 if events:
@@ -71,6 +77,21 @@ class FastLoop(BaseLoop):
                     return  # something happened — fire
             except Exception as e:
                 logger.debug("[%s:fast] event poll failed: %s", self.name, e)
+            # Also check for new chat messages at our location.
+            # Don't advance _last_chat_ts here — _gather_context will do that
+            # so the new messages are still visible when the prompt is built.
+            try:
+                scene = await self._ww.get_scene(self._session_id)
+                if scene.location:
+                    chat = await self._ww.get_location_chat(scene.location, since=self._last_chat_ts)
+                    if chat:
+                        logger.info("[%s:fast] new chat at %s — firing", self.name, scene.location)
+                        return
+            except Exception as e:
+                logger.debug("[%s:fast] chat poll failed: %s", self.name, e)
+            if elapsed >= proactive_seconds:
+                logger.info("[%s:fast] proactive fallback — no events for %.0fs", self.name, elapsed)
+                return
 
     # ------------------------------------------------------------------
     # Context: just the scene, just now
@@ -78,7 +99,15 @@ class FastLoop(BaseLoop):
 
     async def _gather_context(self) -> dict:
         scene = await self._ww.get_scene(self._session_id)
-        return {"scene": scene}
+        new_chat: list[ChatMessage] = []
+        if scene.location:
+            try:
+                new_chat = await self._ww.get_location_chat(scene.location, since=self._last_chat_ts)
+                if new_chat:
+                    self._last_chat_ts = new_chat[-1].ts
+            except Exception as e:
+                logger.debug("[%s:fast] chat fetch failed: %s", self.name, e)
+        return {"scene": scene, "new_chat": new_chat}
 
     async def _should_act(self, context: dict) -> bool:
         # Could check act_threshold against scene busyness, but for now: always act
@@ -90,12 +119,13 @@ class FastLoop(BaseLoop):
 
     async def _decide_and_execute(self, context: dict) -> None:
         scene = context["scene"]
+        new_chat: list[ChatMessage] = context.get("new_chat", [])
 
         # The system prompt is the character. Nothing else.
         system_prompt = self._identity.soul
 
         # The user prompt is a compact scene-check — short question, short answer.
-        user_prompt = self._build_fast_prompt(scene)
+        user_prompt = self._build_fast_prompt(scene, new_chat)
 
         response = await self._llm.complete(
             system_prompt=system_prompt,
@@ -109,6 +139,24 @@ class FastLoop(BaseLoop):
 
         if not action:
             logger.debug("[%s:fast] empty response, skipping", self.name)
+            return
+
+        # Parse optional REPLY: prefix for chat opt-in.
+        # If the agent starts their response with "REPLY: ...", post it as a
+        # location chat message and stop — no world action is submitted.
+        # Silence (no REPLY: prefix) is always respected.
+        reply_text = self._extract_reply(action)
+        if reply_text:
+            try:
+                await self._ww.post_location_chat(
+                    location=scene.location,
+                    session_id=self._session_id,
+                    message=reply_text,
+                    display_name=self._identity.name,
+                )
+                logger.info("[%s:fast] chat reply: %s", self.name, reply_text[:80])
+            except Exception as e:
+                logger.warning("[%s:fast] chat post failed: %s", self.name, e)
             return
 
         # Check if agent flagged something as a notable impression
@@ -147,7 +195,7 @@ class FastLoop(BaseLoop):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _build_fast_prompt(self, scene) -> str:
+    def _build_fast_prompt(self, scene, new_chat: list | None = None) -> str:
         """
         Scene-grounded prompt that lets the agent respond naturally —
         thought, speech, or action — and feeds into the server's narration pipeline.
@@ -185,9 +233,31 @@ class FastLoop(BaseLoop):
             parts.append(f"Recent:\n{event_lines}")
         if own_lines:
             parts.append(own_lines)
-        parts.append("What do you do, say, or notice? Respond naturally and briefly.")
+
+        # New chat messages — shown as a separate section with reply affordance
+        if new_chat:
+            chat_lines = "\n".join(
+                f"- {m.display_name}: \"{m.message}\"" for m in new_chat[-5:]
+            )
+            parts.append(
+                f"Chat here:\n{chat_lines}\n\n"
+                "Someone spoke. You can reply by starting your response with REPLY: followed by what you say. "
+                "Or ignore it and do something else. Silence is fine."
+            )
+        else:
+            parts.append("What do you do, say, or notice? Respond naturally and briefly.")
 
         return "\n\n".join(parts)
+
+    def _extract_reply(self, text: str) -> str:
+        """
+        If the agent opted in to chat by starting with 'REPLY:', return the reply text.
+        Otherwise return empty string. Case-insensitive.
+        """
+        stripped = text.strip()
+        if stripped.upper().startswith("REPLY:"):
+            return stripped[len("REPLY:"):].strip()
+        return ""
 
     def _extract_impression(self, text: str) -> tuple[str, str]:
         """
