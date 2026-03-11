@@ -1,0 +1,41 @@
+{
+    "_comment": "Loop parameters that define personality through temporal dynamics.",
+    "_personality_guide": {
+        "reactive_impulsive": "Low fast cooldown, high impression threshold, fast mail send",
+        "deliberate_reserved": "High fast cooldown, low impression threshold, slow mail with high discard",
+        "prolific_correspondent": "Minimal fast loop, many staged drafts, frequent mail loop",
+        "socially_absent_recluse": "Rare fast fires, wide slow context, mail disabled"
+    },
+    "wander": {
+        "enabled": true,
+        "seconds": 180,
+        "temperature": 0.9
+    },
+    "fast": {
+        "cooldown_seconds": 45,
+        "proactive_seconds": 90,
+        "act_threshold": 0.5,
+        "max_context_events": 5,
+        "model": null,
+        "temperature": 0.85,
+        "max_tokens": 200
+    },
+    "slow": {
+        "impression_threshold": 3,
+        "fallback_seconds": 300,
+        "max_context_events": 20,
+        "model": null,
+        "temperature": 0.6,
+        "max_tokens": 500
+    },
+    "mail": {
+        "enabled": true,
+        "poll_seconds": 600,
+        "send_delay_seconds": 120,
+        "discard_threshold": 0.5,
+        "max_letter_words": 300,
+        "model": null,
+        "temperature": 0.6,
+        "max_tokens": 500
+    }
+}
