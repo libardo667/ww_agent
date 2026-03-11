@@ -62,6 +62,15 @@ class Letter:
     body: str
 
 
+@dataclass
+class ChatMessage:
+    id: int
+    session_id: str
+    display_name: str
+    message: str
+    ts: str  # ISO-8601
+
+
 # ---------------------------------------------------------------------------
 # Prose rendering — SceneData → natural language for LLM prompts
 # The agent never sees raw API fields.
@@ -343,6 +352,100 @@ class WorldWeaverClient:
             timeout=30.0,
         )
         return resp.json()
+
+    # ------------------------------------------------------------------
+    # Location chat (co-located async messaging)
+    # ------------------------------------------------------------------
+
+    async def get_location_chat(self, location: str, since: str | None = None) -> list[ChatMessage]:
+        """Return recent chat messages at a location. Used by fast loop."""
+        params: dict[str, Any] = {"limit": "30"}
+        if since:
+            params["since"] = since
+        resp = await self._get_with_retry(
+            f"/api/world/location/{location}/chat",
+            params=params,
+            timeout=self._timeout_scene,
+        )
+        data = resp.json()
+        return [
+            ChatMessage(
+                id=m.get("id", 0),
+                session_id=m.get("session_id", ""),
+                display_name=m.get("display_name") or m.get("session_id", "")[:12],
+                message=m.get("message", ""),
+                ts=m.get("ts", ""),
+            )
+            for m in data.get("messages", [])
+        ]
+
+    async def post_location_chat(
+        self,
+        location: str,
+        session_id: str,
+        message: str,
+        display_name: str,
+    ) -> dict:
+        """Post a chat message at a location on behalf of an agent."""
+        resp = await self._post(
+            f"/api/world/location/{location}/chat",
+            {"session_id": session_id, "message": message, "display_name": display_name},
+            timeout=30.0,
+        )
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Real-world grounding + map movement
+    # ------------------------------------------------------------------
+
+    async def get_grounding(self) -> dict:
+        """
+        Fetch current SF time + weather from the worldweaver grounding endpoint.
+        Keys: datetime_str, day_of_week, time_of_day, season, hour, month,
+              weather, temperature_f, weather_description
+        Returns empty dict on failure — callers must handle gracefully.
+        """
+        try:
+            resp = await self._get("/api/world/grounding", timeout=8.0)
+            return resp.json()
+        except Exception as e:
+            logger.debug("[grounding] fetch failed: %s", e)
+            return {}
+
+    async def post_map_move(self, session_id: str, destination: str) -> dict:
+        """
+        Move one hop toward destination along the city graph.
+        Bypasses NL movement detection — explicit map route.
+        Returns: {moved, from_location, to_location, route, route_remaining, narrative}
+        """
+        resp = await self._post(
+            "/api/game/move",
+            {"session_id": session_id, "destination": destination},
+            timeout=30.0,
+        )
+        return resp.json()
+
+    # City map — grounded geography for slow loop context
+    # ------------------------------------------------------------------
+
+    async def get_location_map_context(self, session_id: str, location: str) -> str:
+        """
+        Fetch compressed prose geography context for a location.
+        Returns a short text block (neighborhood, adjacency, transit, landmarks)
+        suitable for injection into the slow loop prompt.
+        Returns empty string if no city pack is available.
+        """
+        try:
+            resp = await self._get_with_retry(
+                f"/api/world/map/{session_id}/context",
+                params={"location": location},
+                timeout=10.0,
+            )
+            data = resp.json()
+            return data.get("context", "")
+        except Exception as e:
+            logger.debug("[map] context fetch failed for %s: %s", location, e)
+            return ""
 
     # ------------------------------------------------------------------
     # Internal helpers
