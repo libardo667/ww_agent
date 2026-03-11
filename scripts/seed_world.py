@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 import urllib.request
@@ -50,7 +51,7 @@ DEFAULT_DESCRIPTION = (
     "Do not invent conflict or drama — let the texture of ordinary life be enough."
 )
 
-DEFAULT_STORYLET_COUNT = 20
+DEFAULT_STORYLET_COUNT = 5
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ def _post(url: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=None) as resp:
         return json.loads(resp.read())
 
 
@@ -148,9 +149,24 @@ def main() -> None:
     parser.add_argument("--tone", default=DEFAULT_TONE)
     parser.add_argument("--count", type=int, default=DEFAULT_STORYLET_COUNT)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--city-pack",
+        action="store_true",
+        help="Seed location graph from SF city pack instead of LLM-generated locations (expensive one-time op)",
+    )
+    parser.add_argument("--city-id", default="san_francisco", help="City pack ID to use (default: san_francisco)")
     args = parser.parse_args()
 
     server = args.server.rstrip("/")
+
+    # 0. Stop agent service (city-pack seed is long-running and exhausts the DB pool)
+    if args.city_pack and not args.dry_run:
+        print("[0/3] Stopping agent service to free DB connections during seeding...")
+        try:
+            subprocess.run(["docker", "compose", "stop", "agent"], check=True, capture_output=True)
+            print("      ok: agent stopped")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("      warning: could not stop agent service (not running or docker not available)")
 
     # 1. Hard reset
     if not args.no_reset:
@@ -176,9 +192,18 @@ def main() -> None:
         "tone": args.tone,
         "storylet_count": args.count,
     }
+    if args.city_pack:
+        seed_payload["seed_from_city_pack"] = True
+        seed_payload["city_id"] = args.city_id
+
     print(f"\n[2/3] Seed world: POST {server}/api/world/seed")
+    if args.city_pack:
+        print(f"      [city-pack mode] Using '{args.city_id}' city pack for location graph (this will take a few minutes)")
+    _skip_display = {"storylet_count"} if args.city_pack else set()
     print("      payload:")
     for k, v in seed_payload.items():
+        if k in _skip_display:
+            continue
         short = v if len(str(v)) <= 80 else str(v)[:77] + "..."
         print(f"        {k}: {short}")
 
@@ -188,7 +213,12 @@ def main() -> None:
             result = _post(f"{server}/api/world/seed", seed_payload)
             world_id = result.get("world_id")
             storylet_count = result.get("storylet_count", "?")
-            print(f"      ok: world_id={world_id}  storylets={storylet_count}")
+            nodes_seeded = result.get("nodes_seeded", None)
+            city_pack_used = result.get("city_pack_used", None)
+            summary = f"world_id={world_id}  storylets={storylet_count}"
+            if nodes_seeded is not None:
+                summary += f"  nodes={nodes_seeded}  city_pack={city_pack_used}"
+            print(f"      ok: {summary}")
         except urllib.error.HTTPError as e:
             body = e.read().decode()
             print(f"      ERROR {e.code}: {body}", file=sys.stderr)
@@ -209,7 +239,10 @@ def main() -> None:
     print(f"\nDone. World is ready.")
     if world_id:
         print(f"  world_id: {world_id}")
-    print("  Start ww_agent to boot residents into the new world.")
+    if args.city_pack and not args.dry_run:
+        print("  Run: docker compose start agent   (to boot residents into the new world)")
+    else:
+        print("  Start ww_agent to boot residents into the new world.")
 
 
 if __name__ == "__main__":
