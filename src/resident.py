@@ -177,6 +177,15 @@ class Resident:
         session_id = f"{name_slug}-{ts}"
         identity = self._identity
 
+        # Always re-fetch the live world_id when creating a new session.
+        # The startup world_id may be stale after a canon reset — using it
+        # would attach the session to a world that no longer exists.
+        live_world_id = await self._ww.get_world_id()
+        if live_world_id:
+            world_id = live_world_id
+        else:
+            logger.warning("[%s] could not fetch live world_id — using startup value", self.name)
+
         # player_role format "Name — vibe" lets the server extract just the name
         player_role = (
             f"{identity.name} — {identity.vibe}" if identity.vibe else identity.name
