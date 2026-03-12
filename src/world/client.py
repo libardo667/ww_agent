@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -181,6 +182,26 @@ class WorldWeaverClient:
             resp = await self._get("/api/world/digest", timeout=15.0)
             data = resp.json()
             return [entry["session_id"] for entry in data.get("roster", []) if entry.get("session_id")]
+        except Exception:
+            return []
+
+    async def get_human_player_names(self) -> list[str]:
+        """Return display/player names for human (non-agent) roster entries."""
+        _AGENT_SLUG = re.compile(r"^[a-z][a-z0-9_]*[-_]\d{8}")
+        try:
+            resp = await self._get("/api/world/digest", timeout=15.0)
+            data = resp.json()
+            names = []
+            for entry in data.get("roster", []):
+                sid = entry.get("session_id", "")
+                if _AGENT_SLUG.match(sid):
+                    continue  # skip AI agent sessions
+                for field in ("player_name", "display_name"):
+                    val = entry.get(field)
+                    if val:
+                        names.append(val)
+                        break
+            return names
         except Exception:
             return []
 

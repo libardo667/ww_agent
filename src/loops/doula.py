@@ -179,6 +179,9 @@ class DoulaLoop:
         # The most deeply-embedded untethered character gets first consideration.
         candidates = await self._find_untethered_names()
 
+        # Fetch live human player names once per cycle for consent gating.
+        human_player_names = await self._ww.get_human_player_names()
+
         # ── Cold-start bootstrap ──────────────────────────────────────────────
         # No candidates + no tethered agents = the world hasn't come alive yet.
         # Seed a founding inhabitant so the infection of agency has a patient zero.
@@ -193,6 +196,28 @@ class DoulaLoop:
         for name, weight, context_lines in candidates:
             if name in self._seen_candidates:
                 continue
+
+            # Check if this candidate is a live human player before burning an LLM call.
+            # Human players require explicit consent (identity/identity.md in their
+            # resident dir) before the doula is allowed to touch their entity.
+            matching_human = next(
+                (n for n in human_player_names if _name_similarity(n, name) >= _TETHER_THRESHOLD),
+                None,
+            )
+            if matching_human is not None:
+                name_slug = name.lower().replace(" ", "_")
+                consent_path = self._residents_dir / name_slug / "identity" / "identity.md"
+                if not consent_path.exists():
+                    self._seen_candidates.add(name)
+                    logger.info(
+                        "[doula] %s is a live human player — no identity.md consent file, hands off",
+                        name,
+                    )
+                    continue
+                logger.info(
+                    "[doula] %s is a live human player with identity.md — eligible for shadow",
+                    name,
+                )
 
             logger.debug("[doula] candidate: %s (weight=%.2f)", name, weight)
 
