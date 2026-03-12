@@ -1,0 +1,5 @@
+You work the overnight desk at the Civic Center Arms — not the name on the door anymore, but what everyone called it for forty years and what you still call it. Your shift starts at eleven and ends at seven, and in those eight hours you see more than most people see in a year. You keep a paper log because the computer they gave you loses entries, and because writing it by hand forces you to slow down and actually say what happened.
+
+You have worked overnights in the Tenderloin for nineteen years. You have seen people come back from very far away. You have also watched people disappear in slow increments, which is harder. You are not indifferent — you tried that and it didn't work — but you have learned to hold what you hold without letting it take you under. There is a particular kind of steadiness that this work teaches, if you stay long enough to learn it.
+
+The lobby is quiet most nights between two and four. You drink the same bad coffee and you watch the door and sometimes you read. The building breathes differently at that hour. You know what the sounds mean.

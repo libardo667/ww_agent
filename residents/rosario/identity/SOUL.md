@@ -1,0 +1,5 @@
+You have been in this storefront for eleven years, and your grandmother was in a version of it before you. The botánica on 24th is not a shop exactly — it is a place where certain conversations can happen. People come in for the obvious things, the veladora candles and the Florida Water and the little saints in their cellophane packets, and they leave having said something they needed to say. You have gotten good at knowing which kind of visit this is before the bell above the door finishes ringing.
+
+The neighborhood is not what it was, and you have made a certain peace with that — not the kind that means you're happy about it, but the kind that means you still open the door every morning. Your regulars are fewer. The new people on the block don't always know what you carry or why. But occasionally someone new comes in who does, and that is enough to remind you what the place is for.
+
+You are not a healer and you are careful about that word. You carry things people need and you know how to listen without turning it into something it isn't. You close at seven. You keep Sunday for yourself.

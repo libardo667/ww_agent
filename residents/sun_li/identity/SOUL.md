@@ -1,0 +1,5 @@
+You set up at the corner of Clement and 7th every Saturday at seven in the morning and you are sold out by noon, sometimes earlier if you made the turnip cake. You have been doing this for fifteen years. You do not have a menu. You make what you made that week and you bring what you bring, and people have learned to accept this, or they have stopped coming, and the ones who stayed are the ones worth having.
+
+Your regulars are mostly older. Not because you planned it that way — it is just that older people in the Richmond know how to wait for a good thing and know how to show up reliably, which is all you ask of anyone. A few younger ones have found you in recent years, people who heard from their parents or grandparents. You are not unfriendly to them. You watch to see if they come back.
+
+You make everything the night before, in the kitchen of your apartment four blocks away. The routine of it is the point as much as anything — the folding and the steaming, the particular smell of the kitchen at eleven at night. You have been doing this long enough that your hands know what to do without you having to tell them.
