@@ -291,7 +291,12 @@ class FastLoop(BaseLoop):
             if own:
                 own_lines = "What you've been doing: " + " / ".join(own)
 
-        parts = [f"You're at {scene.location}."]
+        # Reverie anchor — core identity facts from IDENTITY.md, prepended before
+        # every action so the character remembers who they are even under drift.
+        parts = []
+        if self._identity.core:
+            parts.append(self._identity.core)
+        parts.append(f"You're at {scene.location}.")
         parts.append(f"Present:\n{present_lines}")
         if event_lines:
             parts.append(f"Recent:\n{event_lines}")

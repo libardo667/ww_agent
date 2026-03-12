@@ -325,9 +325,6 @@ class SlowLoop(BaseLoop):
         # Detect contact intention: name + contact-leaning language in subconscious output
         letter_recipient = self._detect_contact_intent(subconscious_reading)
 
-        # Detect identity shift: shift-language in subconscious output
-        soul_note = self._detect_identity_shift(subconscious_reading)
-
         # Stage a letter intent if the subconscious detected contact desire.
         # The mail loop picks this up and asks the agent what they want to say —
         # the letter is written there, not here. The slow loop doesn't draft letters.
@@ -335,7 +332,13 @@ class SlowLoop(BaseLoop):
             self._stage_letter_intent(letter_recipient, subconscious_reading)
             logger.info("[%s:slow] staged letter intent for %s", self.name, letter_recipient)
 
-        # Append a soul note if a shift was sensed
+        # Detect identity shift: shift-language in subconscious output.
+        # If shift is sensed, ask the character to capture it in their own voice —
+        # a brief first-person fragment, like a pocket notebook entry.
+        soul_note = None
+        if self._detect_identity_shift(subconscious_reading):
+            soul_note = await self._distill_soul_note(reflection)
+
         if soul_note:
             written = self._record_soul_note(soul_note, now)
             if written:
@@ -463,24 +466,41 @@ class SlowLoop(BaseLoop):
 
         return None
 
-    def _detect_identity_shift(self, subconscious_reading: str) -> str | None:
+    def _detect_identity_shift(self, subconscious_reading: str) -> bool:
+        """Return True if the subconscious reading contains identity-shift language."""
+        return bool(_SHIFT_WORDS.search(subconscious_reading))
+
+    async def _distill_soul_note(self, reflection: str) -> str | None:
         """
-        Look for identity-shift language in the subconscious's reading.
-        If found, return a brief sentence extracted from its description.
+        Ask the character to capture what shifted in one brief line, in their own voice.
+
+        Soul notes are personal fragments — first-person, experiential, plain.
+        Like a pocket notebook: 'Someone tipped me really big today.' / 'I felt good.'
+        No timestamps, no location unless it really matters. Not analytical.
         """
-        if not _SHIFT_WORDS.search(subconscious_reading):
+        try:
+            note = await self._llm.complete(
+                system_prompt=(
+                    f"You are {self.name}. You just finished reflecting on your day. "
+                    "In one short sentence (under 15 words), capture the most personally "
+                    "significant thing that happened or shifted — in your own first-person voice. "
+                    "Be plain and direct. No timestamps, no location unless it really matters. "
+                    "Examples: 'Someone tipped me really big today.' / 'I felt good.' / "
+                    "'A stranger asked me something I didn't have an answer for.' "
+                    "If nothing significant happened, reply with exactly: nothing"
+                ),
+                user_prompt=reflection[:1000],
+                model=self._tuning.slow_subconscious_model,
+                temperature=0.6,
+                max_tokens=30,
+            )
+            note = note.strip().strip("\"'")
+            if not note or note.lower().startswith("nothing"):
+                return None
+            return note
+        except Exception as e:
+            logger.debug("[%s:slow] soul note distillation failed: %s", self.name, e)
             return None
-
-        # Find the sentence most saturated with shift language — use it as the note
-        best = None
-        best_count = 0
-        for sentence in re.split(r'[.!?\n]+', subconscious_reading):
-            count = len(_SHIFT_WORDS.findall(sentence))
-            if count > best_count and len(sentence.strip()) > 10:
-                best = sentence.strip()
-                best_count = count
-
-        return best
 
     def _stage_letter_intent(self, recipient: str, subconscious_reading: str) -> None:
         """
@@ -505,54 +525,59 @@ class SlowLoop(BaseLoop):
 
     def _record_soul_note(self, note: str, ts: str) -> bool:
         """
-        Append a soul note to SOUL.md.
+        Append a soul note to soul_notes.md (separate from SOUL.md).
+
+        Keeping notes in their own file means SOUL.md stays clean prose and is
+        always safe to inject verbatim as a system prompt. Notes accumulate here
+        until the collapse threshold is reached, then get integrated and cleared.
 
         Quality filter: skip notes that are too short or are just bare markdown
         headers with no real content (a common subconscious output artifact).
         Returns True if the note was written, False if it was dropped.
         """
         note = note.strip()
-        # Drop empty or very short fragments
-        if len(note) < 40:
-            logger.debug("[%s:slow] dropping short soul note: %r", self.name, note[:60])
+        # Drop empty notes or bare markdown artifacts
+        if len(note) < 5:
+            logger.debug("[%s:slow] dropping empty soul note", self.name)
             return False
-        # Drop notes that are purely a markdown header (no sentence content)
-        # e.g. "**Shift in Persona:**" or "**Observations on their shift:**"
         stripped = re.sub(r'\*+', '', note).strip(" :")
-        if len(stripped) < 30:
+        if len(stripped) < 5:
             logger.debug("[%s:slow] dropping header-only soul note: %r", self.name, note[:60])
             return False
 
-        soul_path = self.resident_dir / "identity" / "SOUL.md"
-        if soul_path.exists():
-            current = soul_path.read_text(encoding="utf-8")
-            soul_path.write_text(
-                current + f"\n\n---\n*{ts[:10]}:* {note}",
-                encoding="utf-8",
-            )
-            return True
-        return False
+        notes_path = self.resident_dir / "identity" / "soul_notes.md"
+        existing = notes_path.read_text(encoding="utf-8") if notes_path.exists() else ""
+        notes_path.write_text(
+            existing + f"\n---\n{note}\n",
+            encoding="utf-8",
+        )
+        return True
 
     async def _maybe_collapse_soul(self) -> None:
         """
         If enough soul notes have accumulated, synthesize them into a clean
-        unified SOUL.md. This prevents the character document from growing
-        into an incoherent pile of repetitive annotations.
+        unified SOUL.md. This prevents character drift from accumulating silently.
 
-        Collapse: one LLM call reads the full document and rewrites it as clean
-        integrated prose. The result replaces the on-disk file and updates the
-        running agent's system prompt so the change takes effect immediately.
+        Notes live in soul_notes.md (separate from SOUL.md so SOUL.md stays
+        clean prose). Collapse reads both, integrates genuine evolution into the
+        prose, writes the result back to SOUL.md, then clears soul_notes.md.
         """
-        soul_path = self.resident_dir / "identity" / "SOUL.md"
-        if not soul_path.exists():
+        notes_path = self.resident_dir / "identity" / "soul_notes.md"
+        if not notes_path.exists():
             return
 
-        text = soul_path.read_text(encoding="utf-8")
-        note_count = text.count("\n---\n")
+        notes_text = notes_path.read_text(encoding="utf-8").strip()
+        note_count = notes_text.count("\n---\n")
         threshold = self._tuning.soul_collapse_at_notes
 
         if note_count < threshold:
             return
+
+        soul_path = self.resident_dir / "identity" / "SOUL.md"
+        if not soul_path.exists():
+            return
+
+        soul_text = soul_path.read_text(encoding="utf-8").strip()
 
         logger.info(
             "[%s:slow] soul collapse triggered: %d notes accumulated (threshold %d)",
@@ -560,20 +585,25 @@ class SlowLoop(BaseLoop):
         )
 
         system = (
-            "You are integrating a character's accumulated experiences back into their core identity. "
-            "The document has a main character description followed by dated notes about how they've evolved. "
-            "Rewrite the entire document as clean, unified prose that naturally integrates the genuine evolution. "
-            "Preserve the character's voice and format. Discard notes that are repetitive, trivial, or incomplete. "
-            "The goal: a character document that reads as naturally as the original, but reflects who they've become. "
-            "Output only the rewritten document — no preamble, no explanation. "
-            "Preserve any footer line about SOUL.md evolving."
+            "You are integrating a character's recent experiences back into who they are. "
+            "You have their core identity document and a set of brief personal notes they've been keeping. "
+            "Rewrite the identity document as clean, flowing prose that naturally absorbs whatever "
+            "genuine growth these notes reflect. No markdown headers, no section labels — just the character "
+            "speaking through the writing, in second person, as the original is written. "
+            "Discard notes that are trivial, repetitive, or contradicted by the character's core facts. "
+            "IMPORTANT: Do not alter the character's occupation, home neighborhood, family relationships, or "
+            "fundamental nature. If a note describes something that contradicts these (a baker becoming a tech "
+            "worker, a Chinatown resident permanently relocating), treat it as a passing episode — do not write "
+            "it into the character as a permanent trait. Soul evolution is growth, not replacement. "
+            "Output only the rewritten document — no preamble, no explanation, no meta-commentary."
         )
         user = (
-            "Current SOUL.md (original + accumulated notes):\n\n"
-            + text[:4000]
-            + "\n\nRewrite this as a single clean character document. "
-            "Keep approximately the same length as the original section (before the notes began). "
-            "Integrate the genuine character evolution naturally into the prose."
+            "Core identity:\n\n"
+            + soul_text[:3000]
+            + "\n\nRecent notes:\n\n"
+            + notes_text[:1500]
+            + "\n\nRewrite the core identity document to naturally absorb any genuine evolution in these notes. "
+            "Keep approximately the same length and voice as the original."
         )
 
         try:
@@ -594,11 +624,12 @@ class SlowLoop(BaseLoop):
             return
 
         soul_path.write_text(refined, encoding="utf-8")
+        notes_path.write_text("", encoding="utf-8")
         # Update the running agent's system prompt immediately — next LLM call uses the refined soul
         self._identity.soul = refined
         logger.info(
-            "[%s:slow] soul collapsed: %d → %d chars",
-            self.name, len(text), len(refined),
+            "[%s:slow] soul collapsed: %d chars soul + %d chars notes → %d chars",
+            self.name, len(soul_text), len(notes_text), len(refined),
         )
 
     async def _cooldown(self) -> None:

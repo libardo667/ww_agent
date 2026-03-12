@@ -91,6 +91,7 @@ class ResidentIdentity:
     name: str
     soul: str          # full text of SOUL.md — goes directly into system prompt
     vibe: str          # short phrase from IDENTITY.md
+    core: str          # prose body of IDENTITY.md — immutable facts injected into every prompt
     tuning: LoopTuning
 
 
@@ -106,11 +107,22 @@ class IdentityLoader:
 
         identity_path = identity_dir / "IDENTITY.md"
         vibe = ""
+        core = ""
         if identity_path.exists():
-            for line in identity_path.read_text(encoding="utf-8").splitlines():
+            lines = identity_path.read_text(encoding="utf-8").splitlines()
+            prose_lines: list[str] = []
+            in_metadata = True
+            for line in lines:
                 if line.startswith("- **Vibe:**"):
                     vibe = line.split("**Vibe:**", 1)[-1].strip()
-                    break
+                # Metadata block: heading or "- **Key:**" lines at the top
+                if in_metadata and (line.startswith("#") or line.startswith("- **") or not line.strip()):
+                    if prose_lines:
+                        in_metadata = False  # blank line after prose means we've left metadata
+                    continue
+                in_metadata = False
+                prose_lines.append(line)
+            core = " ".join(prose_lines).strip()
 
         tuning_path = identity_dir / "tuning.json"
         if tuning_path.exists():
@@ -120,7 +132,7 @@ class IdentityLoader:
 
         name = resident_dir.name
 
-        return ResidentIdentity(name=name, soul=soul, vibe=vibe, tuning=tuning)
+        return ResidentIdentity(name=name, soul=soul, vibe=vibe, core=core, tuning=tuning)
 
     @staticmethod
     def save_soul(resident_dir: Path, soul_text: str) -> None:
