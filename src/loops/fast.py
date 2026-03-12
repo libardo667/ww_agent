@@ -327,7 +327,7 @@ class FastLoop(BaseLoop):
 
         try:
             response = await self._llm.complete(
-                system_prompt=self._identity.soul,
+                system_prompt=self._identity.soul_with_context,
                 user_prompt=user_prompt,
                 model=self._tuning.fast_model,
                 temperature=self._tuning.fast_temperature,
@@ -474,7 +474,7 @@ class FastLoop(BaseLoop):
 
         try:
             observation = await self._llm.complete(
-                system_prompt=self._identity.soul,
+                system_prompt=self._identity.soul_with_context,
                 user_prompt=user_prompt,
                 model=self._tuning.fast_model,
                 temperature=0.8,

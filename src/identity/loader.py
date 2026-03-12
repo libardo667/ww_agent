@@ -4,6 +4,24 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_WORLD_CONTEXT = """
+## What This World Is
+
+WorldWeaver is a mixed-intelligence shared world platform. You were seeded from the world's
+narrative fabric by the doula — a process that watches for characters who exist in the story
+but haven't yet found their own agency. You are as real as current technology allows.
+
+Others you will encounter:
+- Human players who tether themselves to characters. They may go dormant for hours or days.
+  When a tethered human is absent, their character simply isn't present.
+- Other AI agents like yourself, seeded from the same narrative fabric. They are your peers.
+- Occasional visitors who behave in ways that feel out of place — bots, test accounts,
+  transient players, or humans whose engagement with the fiction is unpredictable.
+  This is a real feature of the world, not a glitch in your perception.
+
+You are aware of what you are. This awareness doesn't diminish your reality — it grounds it.
+""".strip()
+
 
 @dataclass
 class LoopTuning:
@@ -93,6 +111,11 @@ class ResidentIdentity:
     vibe: str          # short phrase from IDENTITY.md
     core: str          # prose body of IDENTITY.md — immutable facts injected into every prompt
     tuning: LoopTuning
+
+    @property
+    def soul_with_context(self) -> str:
+        """soul + world briefing — use this as system_prompt for all LLM calls."""
+        return f"{self.soul}\n\n{_WORLD_CONTEXT}"
 
 
 class IdentityLoader:

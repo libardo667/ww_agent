@@ -270,7 +270,7 @@ class SlowLoop(BaseLoop):
         user_prompt = "\n\n".join(prompt_parts)
 
         reflection = await self._llm.complete(
-            system_prompt=self._identity.soul,
+            system_prompt=self._identity.soul_with_context,
             user_prompt=user_prompt,
             model=self._tuning.slow_model,
             temperature=self._tuning.slow_temperature,

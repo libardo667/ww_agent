@@ -103,6 +103,48 @@ class _SpawnLedger:
         self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+class _PollLedger:
+    def __init__(self, path: Path):
+        self._path = path
+
+    def _load(self) -> dict:
+        if self._path.exists():
+            try:
+                return json.loads(self._path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    def _save(self, data: dict) -> None:
+        self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def add_poll(self, name: str, payload: dict) -> None:
+        data = self._load()
+        if "polls" not in data:
+            data["polls"] = {}
+        data["polls"][name] = payload
+        self._save(data)
+
+    def get_all_polls(self) -> dict:
+        return self._load().get("polls", {})
+
+    def remove_poll(self, name: str) -> None:
+        data = self._load()
+        if "polls" in data and name in data["polls"]:
+            del data["polls"][name]
+            self._save(data)
+
+    def record_seen_letter(self, filename: str) -> None:
+        data = self._load()
+        if "seen_letters" not in data:
+            data["seen_letters"] = []
+        data["seen_letters"].append(filename)
+        self._save(data)
+
+    def is_letter_seen(self, filename: str) -> bool:
+        return filename in self._load().get("seen_letters", [])
+
+
 # ---------------------------------------------------------------------------
 # Doula loop
 # ---------------------------------------------------------------------------
@@ -150,6 +192,9 @@ class DoulaLoop:
         self._ledger = _SpawnLedger(
             residents_dir / ".doula_spawns.json", max_spawns_per_day
         )
+        self._poll_ledger = _PollLedger(
+            residents_dir / ".doula_polls.json"
+        )
         self._running = False
         self._seen_candidates: set[str] = set()  # don't re-evaluate same name in same day
         self._place_names_cache: set[str] | None = None  # refreshed each scan cycle
@@ -178,6 +223,9 @@ class DoulaLoop:
     # ------------------------------------------------------------------
 
     async def _scan(self) -> None:
+        # First, check active polls and collect replies
+        await self._check_polls()
+
         if not self._ledger.can_spawn():
             logger.debug("[doula] daily spawn limit reached")
             return
@@ -238,9 +286,9 @@ class DoulaLoop:
             logger.debug("[doula] %s classified as: %s", name, entity_class.value)
 
             if entity_class == EntityClass.STATIC:
-                # Permanently settled — never spawn, never reconsider.
+                # Permanently settled — inject as WorldNode and never reconsider.
                 self._seen_candidates.add(name)
-                await self._scaffold_pending_review(name, context_lines, entity_class)
+                await self._inject_place_node(name, context_lines)
                 continue
 
             if entity_class == EntityClass.PLAYER_NO_CONTRACT:
@@ -289,18 +337,134 @@ class DoulaLoop:
                 return
 
             logger.info(
-                "[doula] %s: all gates open (class=%s, weight=%.2f) at %s — seeding resident",
+                "[doula] %s: all gates open (class=%s, weight=%.2f) at %s",
                 name,
                 entity_class.value,
                 weight,
                 found_at,
             )
-            await self._seed_and_spawn(
-                name, context_lines, entry_location=found_at, entity_class=entity_class
-            )
+            
+            if entity_class == EntityClass.NOVEL:
+                await self._initiate_poll(
+                    name=name, context_lines=context_lines, found_at=found_at, entity_class=entity_class, weight=weight
+                )
+            else:
+                await self._seed_and_spawn(
+                    name, context_lines, entry_location=found_at, entity_class=entity_class
+                )
 
-            # One spawn per scan cycle — let the world absorb it
+            # One spawn or poll per scan cycle — let the world absorb it
             return
+
+    # ------------------------------------------------------------------
+    # Polls — ask agents to vote on classification
+    # ------------------------------------------------------------------
+
+    async def _initiate_poll(
+        self, name: str, context_lines: list[str], found_at: str | None, entity_class: EntityClass, weight: float
+    ) -> None:
+        voters = []
+        for session_id in self._sessions:
+            if session_id == "system_doula": continue
+            voters.append(session_id)
+            
+        if not voters:
+            logger.info("[doula] No voters available for poll on %s — seeding directly", name)
+            await self._seed_and_spawn(name, context_lines, entry_location=found_at, entity_class=entity_class)
+            return
+
+        body = (
+            f"The Doula is asking for your input on a new presence named '{name}'.\n"
+            f"Please reply with exactly 'VOTE: PERSON' if you believe {name} is an active character/person, "
+            f"or 'VOTE: PLACE' if you believe {name} is a static building, business, or landmark.\n\n"
+            "Evidence we have:\n" + "\n".join(f"- {s}" for s in context_lines[:5])
+        )
+
+        for voter in voters:
+            try:
+                agent_name = voter.replace("agent-", "") if voter.startswith("agent-") else voter
+                await self._ww.send_letter(
+                    from_name="The Doula", to_agent=agent_name, body=body, session_id="system_doula"
+                )
+            except Exception as e:
+                logger.warning("[doula] Failed to send poll to %s: %s", voter, e)
+
+        expires_at = datetime.now(timezone.utc).timestamp() + 3600 * 2  # 2 hours TTL
+        self._poll_ledger.add_poll(name, {
+            "name": name,
+            "context_lines": context_lines,
+            "entry_location": found_at,
+            "entity_class": entity_class.value,
+            "weight": weight,
+            "expires_at": expires_at,
+            "voters": voters,
+            "votes": {}
+        })
+        logger.info("[doula] Initiated poll for %s with %d AI voters", name, len(voters))
+
+    async def _check_polls(self) -> None:
+        polls = self._poll_ledger.get_all_polls()
+        if not polls:
+            return
+
+        # 1. Fetch Doula inbox for replies
+        try:
+            inbox = await self._ww.get_player_inbox("system_doula")
+            for letter in inbox:
+                if self._poll_ledger.is_letter_seen(letter.filename):
+                    continue
+                    
+                match = re.search(r"from_(.+?)_\d", letter.filename)
+                if not match: 
+                    self._poll_ledger.record_seen_letter(letter.filename)
+                    continue
+                    
+                sender = match.group(1).lower()
+                vote_type = None
+                
+                body_upper = letter.body.upper()
+                if "VOTE: PERSON" in body_upper:
+                    vote_type = "AGENT"
+                elif "VOTE: PLACE" in body_upper:
+                    vote_type = "STATIC"
+                
+                if vote_type:
+                    # Map the sender agent to the session_id format
+                    session_sender = f"agent-{sender}"
+                    # Apply vote to the first poll that is waiting for this sender
+                    for poll_name, poll in polls.items():
+                        if session_sender in poll["voters"] and sender not in poll["votes"]:
+                            poll["votes"][sender] = vote_type
+                            self._poll_ledger.add_poll(poll_name, poll)
+                            logger.info("[doula] Recorded %s vote from %s for %s", vote_type, sender, poll_name)
+                            break
+
+                self._poll_ledger.record_seen_letter(letter.filename)
+        except Exception as e:
+            logger.warning("[doula] Failed to check polls inbox: %s", e)
+
+        # 2. Resolve expired or fully-voted polls
+        now = datetime.now(timezone.utc).timestamp()
+        
+        # reload polls state before resolving
+        polls = self._poll_ledger.get_all_polls()
+        for poll_name, poll in list(polls.items()):
+            if now > poll["expires_at"] or len(poll["votes"]) >= len(poll["voters"]):
+                agent_votes = sum(1 for v in poll["votes"].values() if v == "AGENT")
+                static_votes = sum(1 for v in poll["votes"].values() if v == "STATIC")
+                
+                logger.info("[doula] Poll for %s resolved: %d AGENT, %d STATIC", poll_name, agent_votes, static_votes)
+                self._poll_ledger.remove_poll(poll_name)
+                
+                if static_votes > agent_votes or (static_votes > 0 and static_votes == agent_votes):
+                    await self._inject_place_node(poll_name, poll["context_lines"])
+                else:
+                    await self._seed_and_spawn(
+                        poll_name, 
+                        poll["context_lines"], 
+                        entry_location=poll.get("entry_location"), 
+                        entity_class=EntityClass(poll["entity_class"])
+                    )
 
     # ------------------------------------------------------------------
     # Entity classification
@@ -366,41 +530,20 @@ class DoulaLoop:
         except Exception:
             return False
 
-    async def _scaffold_pending_review(
-        self, name: str, context_lines: list[str], entity_class: EntityClass
-    ) -> None:
-        """Write a minimal identity stub to _pending_review/ for steward curation.
+    async def _inject_place_node(self, name: str, context_lines: list[str]) -> None:
+        """Inject a narratively-grounded place as a WorldNode.
 
-        Static entities get a soul stub and an entity_type annotation but are NOT
-        added to the spawn queue. A steward reviews pending_review/ and decides:
-          - approve as static backdrop (voice but no movement loop)
-          - reclassify as mobile person (promote to full resident)
-          - dismiss (delete the stub)
+        Called when the doula classifies a candidate as STATIC (place/geography).
+        Instead of buffering in _pending_review/ for human review, we inject
+        directly into the world graph — the narrative weight threshold already
+        ensures only genuinely-mentioned places get nodes.
         """
-        pending_dir = self._residents_dir / "_pending_review" / name.lower()
-        if pending_dir.exists():
-            logger.debug("[doula] %s already in pending review, skipping", name)
-            return
-
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).isoformat()
-        (pending_dir / "IDENTITY.md").write_text(
-            f"# {name}\n\n"
-            f"- **entity_type:** {entity_class.value}\n"
-            f"- **Spawned-By:** doula (pending review)\n"
-            f"- **Spawned-At:** {ts}\n"
-            f"- **Classification:** {entity_class.value} — matched canonical city-pack geography\n"
-            f"- **Review:** approve (static backdrop), reclassify (full resident), or dismiss\n",
-            encoding="utf-8",
-        )
-        # Minimal soul stub from context evidence — enough for steward to evaluate
-        if context_lines:
-            context_prose = "\n".join(f"- {s}" for s in context_lines[:5] if s)
-            (pending_dir / "SOUL_STUB.md").write_text(
-                f"# {name} — narrative evidence\n\n{context_prose}\n",
-                encoding="utf-8",
-            )
-        logger.info("[doula] %s → _pending_review/ (static entity, awaiting steward review)", name)
+        metadata = {"source": "doula", "context": context_lines[:3]}
+        try:
+            await self._ww.ensure_world_node(name, node_type="location", metadata=metadata)
+            logger.info("[doula] injected WorldNode: %s (location)", name)
+        except Exception as e:
+            logger.warning("[doula] failed to inject WorldNode for %s: %s", name, e)
 
     # ------------------------------------------------------------------
     # Cold-start bootstrap

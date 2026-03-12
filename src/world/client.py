@@ -367,6 +367,17 @@ class WorldWeaverClient:
             for l in data.get("letters", [])
         ]
 
+    async def get_player_inbox(self, session_id: str) -> list[Letter]:
+        """Poll for unread letters deposited by agents into a player session inbox."""
+        resp = await self._get_with_retry(
+            f"/api/world/letters/my-inbox/{session_id}", timeout=self._timeout_scene
+        )
+        data = resp.json()
+        return [
+            Letter(filename=l.get("filename", ""), body=l.get("body", ""))
+            for l in data.get("letters", [])
+        ]
+
     async def send_letter(self, from_name: str, to_agent: str, body: str, session_id: str) -> dict:
         resp = await self._post(
             "/api/world/letter",
@@ -423,6 +434,19 @@ class WorldWeaverClient:
             timeout=30.0,
         )
         return resp.json()
+
+    async def ensure_world_node(
+        self,
+        name: str,
+        node_type: str = "location",
+        metadata: dict | None = None,
+    ) -> None:
+        """Idempotently inject a named entity as a WorldNode. Used by the doula for place injection."""
+        await self._post(
+            "/api/world/graph/ensure_node",
+            {"name": name, "node_type": node_type, "metadata": metadata or {}},
+            timeout=30.0,
+        )
 
     # ------------------------------------------------------------------
     # Real-world grounding + map movement
