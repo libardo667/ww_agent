@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 _ROUTE_FILE = "active_route.json"
 _INTROSPECT_SIGNAL = "introspect_signal"
+# After posting a chat message, suppress chat-triggered firing for this long.
+# Prevents the agent from talking to itself in a loop.
+_CHAT_COOLDOWN_SECONDS = 120.0
 
 # Minimum gap (seconds) between on-demand ground calls from this loop.
 # The GroundLoop handles ambient grounding; we don't need to spam it.
@@ -97,6 +101,7 @@ class FastLoop(BaseLoop):
         self._last_event_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_chat_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_ground_ts: float = 0.0
+        self._chat_cooldown_until: float = 0.0  # monotonic; set after posting chat
         self._first_boot = not working_memory.has_any()
         self._route_path = resident_dir / "memory" / _ROUTE_FILE
         self._signal_path = resident_dir / "memory" / _INTROSPECT_SIGNAL
@@ -130,8 +135,11 @@ class FastLoop(BaseLoop):
                 scene = await self._ww.get_scene(self._session_id)
                 if scene.location:
                     chat = await self._ww.get_location_chat(scene.location, since=self._last_chat_ts)
-                    if chat:
-                        logger.info("[%s:fast] new chat at %s — firing", self.name, scene.location)
+                    # Only trigger on messages from other sessions, and only when
+                    # not in post-chat cooldown (prevents self-triggering loops).
+                    others_chat = [m for m in chat if m.session_id != self._session_id]
+                    if others_chat and time.monotonic() >= self._chat_cooldown_until:
+                        logger.info("[%s:fast] new chat from others at %s — firing", self.name, scene.location)
                         return
             except Exception as e:
                 logger.debug("[%s:fast] chat poll failed: %s", self.name, e)
@@ -345,6 +353,9 @@ class FastLoop(BaseLoop):
                     display_name=self._identity.name,
                 )
                 logger.info("[%s:fast] chat reply: %s", self.name, reply_text[:80])
+                # Advance past our own message and suppress re-triggering for a while
+                self._last_chat_ts = datetime.now(timezone.utc).isoformat()
+                self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
             except Exception as e:
                 logger.warning("[%s:fast] chat post failed: %s", self.name, e)
             return
@@ -412,6 +423,9 @@ class FastLoop(BaseLoop):
                 display_name=self._identity.name,
             )
             logger.info("[%s:fast] chat: %s", self.name, message[:80])
+            # Advance past our own message and suppress re-triggering for a while
+            self._last_chat_ts = datetime.now(timezone.utc).isoformat()
+            self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
         except Exception as e:
             logger.warning("[%s:fast] chat post failed: %s", self.name, e)
 
