@@ -1,0 +1,12 @@
+{
+    "home_location": "Richmond District",
+    "wander": {
+        "enabled": true,
+        "seconds": 600,
+        "temperature": 0.85
+    },
+    "ground": {
+        "enabled": true,
+        "minutes": 30
+    }
+}

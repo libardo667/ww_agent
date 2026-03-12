@@ -1,5 +1,6 @@
 {
     "_comment": "Zhang: sociable, reactive, moves around the neighborhood with purpose.",
+    "home_location": "Chinatown",
     "fast": {
         "cooldown_seconds": 75,
         "act_threshold": 0.5,

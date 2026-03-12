@@ -1,0 +1,12 @@
+{
+    "home_location": "Mission District",
+    "wander": {
+        "enabled": true,
+        "seconds": 720,
+        "temperature": 0.85
+    },
+    "ground": {
+        "enabled": true,
+        "minutes": 30
+    }
+}

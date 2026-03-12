@@ -1,0 +1,12 @@
+{
+    "home_location": "Fillmore",
+    "wander": {
+        "enabled": true,
+        "seconds": 420,
+        "temperature": 0.9
+    },
+    "ground": {
+        "enabled": true,
+        "minutes": 30
+    }
+}

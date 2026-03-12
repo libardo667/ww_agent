@@ -1,5 +1,6 @@
 {
     "_comment": "Fei Fei: deliberate, observational, not impulsive. Slower cadence than Zhang.",
+    "home_location": "Chinatown",
     "fast": {
         "cooldown_seconds": 120,
         "act_threshold": 0.6,
