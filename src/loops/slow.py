@@ -127,6 +127,26 @@ class SlowLoop(BaseLoop):
         while elapsed < fallback:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
+
+            # Fast loop introspect signal: fires us early when the lizard brain
+            # decides now is a good moment to reflect. Refractory still applies.
+            signal_path = self.resident_dir / "memory" / "introspect_signal"
+            if signal_path.exists():
+                import time
+                since_last = time.monotonic() - self._last_fire_ts
+                if since_last >= refractory_seconds:
+                    try:
+                        signal_path.unlink()
+                    except OSError:
+                        pass
+                    logger.info("[%s:slow] introspect signal received — firing early", self.name)
+                    return
+                else:
+                    logger.debug(
+                        "[%s:slow] introspect signal ignored — refractory active (%.0fs left)",
+                        self.name, refractory_seconds - since_last,
+                    )
+
             pending = self._provisional.pending_impressions()
             if len(pending) >= self._tuning.slow_impression_threshold:
                 # Respect refractory period even when threshold is met

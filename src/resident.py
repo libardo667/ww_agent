@@ -114,7 +114,6 @@ class Resident:
                 identity=identity,
                 resident_dir=self._resident_dir,
                 ww_client=self._ww,
-                llm=self._llm,
                 session_id=session_id,
                 working_memory=working,
             )
