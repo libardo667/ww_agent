@@ -648,6 +648,13 @@ class DoulaLoop:
 
         Returns the location where they were found, or None if not found.
 
+        Scans both:
+        - self._sessions: AI resident sessions collected at startup
+        - live roster from /api/world/digest: includes human player sessions
+
+        This means humans exploring and naming characters can trigger organic
+        agent spawning — the "infection of agency" flows from human presence.
+
         NOTE: If the candidate already appears in scene.present (i.e. they have
         an active session — a human player or already-running agent), we return None.
         Presence in scene.present means "already active"; we only spawn agents for
@@ -655,7 +662,12 @@ class DoulaLoop:
         """
         name_lower = candidate_name.lower()
 
-        for session_id in self._sessions:
+        # Merge startup AI sessions with live roster (includes human players).
+        # Use a set to avoid scanning the same session twice.
+        live_session_ids = await self._ww.get_active_session_ids()
+        all_session_ids = list(dict.fromkeys(self._sessions + live_session_ids))
+
+        for session_id in all_session_ids:
             try:
                 scene = await self._ww.get_scene(session_id)
 

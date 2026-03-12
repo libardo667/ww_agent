@@ -175,6 +175,15 @@ class WorldWeaverClient:
         data = resp.json()
         return data.get("world_id") or None
 
+    async def get_active_session_ids(self) -> list[str]:
+        """Return all session IDs currently in the world roster (human + AI)."""
+        try:
+            resp = await self._get("/api/world/digest", timeout=15.0)
+            data = resp.json()
+            return [entry["session_id"] for entry in data.get("roster", []) if entry.get("session_id")]
+        except Exception:
+            return []
+
     # ------------------------------------------------------------------
     # Session Bootstrap
     # ------------------------------------------------------------------
