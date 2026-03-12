@@ -7,13 +7,32 @@ import random
 import re
 from datetime import datetime, date, timezone
 from difflib import SequenceMatcher
+from enum import Enum
 from pathlib import Path
-from typing import Callable
 
 from src.inference.client import InferenceClient
 from src.world.client import WorldWeaverClient
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Entity classification
+# ---------------------------------------------------------------------------
+
+
+class EntityClass(str, Enum):
+    NOVEL = "novel"
+    """Untethered narrative character — no known human origin. Full soul seed + boot."""
+
+    PLAYER_SHADOW = "player_shadow"
+    """Human player who has signed an identity contract. Eligible for AI tether."""
+
+    PLAYER_NO_CONTRACT = "player_no_contract"
+    """Human player with narrative weight but no identity contract. Hands off — do not spawn."""
+
+    STATIC = "static"
+    """Known place, landmark, or institution. No movement loop. Route to pending review."""
+
 
 # ---------------------------------------------------------------------------
 # Fuzzy name matching
@@ -48,6 +67,7 @@ _SEED_SYSTEM = (
 # Rate gate: persisted per calendar day
 # ---------------------------------------------------------------------------
 
+
 class _SpawnLedger:
     def __init__(self, path: Path, max_per_day: int):
         self._path = path
@@ -77,6 +97,7 @@ class _SpawnLedger:
 # Doula loop
 # ---------------------------------------------------------------------------
 
+
 class DoulaLoop:
     """
     World-watching daemon. Not a character loop — has no soul, no scene, no inbox.
@@ -99,8 +120,8 @@ class DoulaLoop:
         llm: InferenceClient,
         residents_dir: Path,
         spawn_queue: asyncio.Queue,
-        tethered_names: set[str],       # shared reference — main keeps this updated
-        known_session_ids: list[str],   # sessions to scan for proximity evidence
+        tethered_names: set[str],  # shared reference — main keeps this updated
+        known_session_ids: list[str],  # sessions to scan for proximity evidence
         *,
         poll_interval_seconds: float = 300.0,
         max_spawns_per_day: int = 5,
@@ -116,9 +137,12 @@ class DoulaLoop:
         self._poll_interval = poll_interval_seconds
         self._spawn_prob = spawn_probability
         self._soul_model = soul_model
-        self._ledger = _SpawnLedger(residents_dir / ".doula_spawns.json", max_spawns_per_day)
+        self._ledger = _SpawnLedger(
+            residents_dir / ".doula_spawns.json", max_spawns_per_day
+        )
         self._running = False
         self._seen_candidates: set[str] = set()  # don't re-evaluate same name in same day
+        self._place_names_cache: set[str] | None = None  # refreshed each scan cycle
 
     async def run(self) -> None:
         self._running = True
@@ -148,9 +172,21 @@ class DoulaLoop:
             logger.debug("[doula] daily spawn limit reached")
             return
 
+        # Refresh place-name cache once per scan cycle (cheap HTTP call)
+        self._place_names_cache = await self._ww.get_place_names()
+
         # Pull candidates — sorted by narrative weight descending.
         # The most deeply-embedded untethered character gets first consideration.
         candidates = await self._find_untethered_names()
+
+        # ── Cold-start bootstrap ──────────────────────────────────────────────
+        # No candidates + no tethered agents = the world hasn't come alive yet.
+        # Seed a founding inhabitant so the infection of agency has a patient zero.
+        if not candidates and not self._tethered:
+            logger.info("[doula] cold world detected — bootstrapping founding inhabitant")
+            await self._bootstrap_cold_start()
+            return
+
         if not candidates:
             return
 
@@ -158,21 +194,54 @@ class DoulaLoop:
             if name in self._seen_candidates:
                 continue
 
-            self._seen_candidates.add(name)
-
             logger.debug("[doula] candidate: %s (weight=%.2f)", name, weight)
 
-            # Proximity: does this name appear in any tethered agent's recent events?
-            found_at = await self._near_tethered_agent(name)
-            if found_at is None:
-                logger.debug("[doula] %s not near any tethered agent, skipping", name)
+            # Classify the candidate before any further processing
+            entity_class = await self._classify(name)
+            logger.debug("[doula] %s classified as: %s", name, entity_class.value)
+
+            if entity_class == EntityClass.STATIC:
+                # Permanently settled — never spawn, never reconsider.
+                self._seen_candidates.add(name)
+                await self._scaffold_pending_review(name, context_lines, entity_class)
                 continue
+
+            if entity_class == EntityClass.PLAYER_NO_CONTRACT:
+                # Human player — permanently hands-off.
+                self._seen_candidates.add(name)
+                logger.info(
+                    "[doula] %s appears to be a human player with no identity contract — hands off",
+                    name,
+                )
+                continue
+
+            # NOVEL or PLAYER_SHADOW: check proximity, then gates.
+            # Soft rejections (proximity miss, random gate) do NOT seal the name —
+            # it will be reconsidered next scan cycle with fresh narrative weight.
+            found_at = await self._near_tethered_agent(name)
+
+            if found_at is None:
+                # No tethered sessions to check proximity against — the infection
+                # hasn't started yet.  High-weight candidates may be the first;
+                # skip the proximity gate and place them at a default location.
+                if not self._sessions:
+                    found_at = await self._default_entry_location()
+                    logger.info(
+                        "[doula] %s: no sessions yet, using default location %s",
+                        name, found_at,
+                    )
+                if found_at is None:
+                    logger.info("[doula] %s: not near any tethered agent — skipping this cycle", name)
+                    continue
 
             # Random gate — keeps it slow and feels like attention rather than automation.
             # Higher narrative weight slightly lifts the probability.
             effective_prob = min(1.0, self._spawn_prob + weight * 0.2)
             if random.random() > effective_prob:
-                logger.debug("[doula] %s passed proximity but random gate closed", name)
+                logger.info(
+                    "[doula] %s: proximity ok (weight=%.2f) but random gate closed (p=%.2f) — will retry",
+                    name, weight, effective_prob,
+                )
                 continue
 
             # Rate gate
@@ -180,11 +249,198 @@ class DoulaLoop:
                 logger.info("[doula] daily limit hit mid-scan, stopping")
                 return
 
-            logger.info("[doula] %s: all gates open (weight=%.2f) at %s — seeding resident", name, weight, found_at)
-            await self._seed_and_spawn(name, context_lines, entry_location=found_at)
+            logger.info(
+                "[doula] %s: all gates open (class=%s, weight=%.2f) at %s — seeding resident",
+                name,
+                entity_class.value,
+                weight,
+                found_at,
+            )
+            await self._seed_and_spawn(
+                name, context_lines, entry_location=found_at, entity_class=entity_class
+            )
 
             # One spawn per scan cycle — let the world absorb it
             return
+
+    # ------------------------------------------------------------------
+    # Entity classification
+    # ------------------------------------------------------------------
+
+    async def _classify(self, candidate_name: str) -> EntityClass:
+        """Classify a candidate name into one of four entity classes.
+
+        Order of precedence:
+        1. STATIC  — fuzzy matches a canonical city-pack place name
+        2. PLAYER_SHADOW / PLAYER_NO_CONTRACT — appears as an event actor
+           (has a live or recent human session)
+        3. NOVEL   — none of the above; pure narrative character
+        """
+        # 1. Static check — known geography beats everything
+        if self._is_known_place(candidate_name):
+            return EntityClass.STATIC
+
+        # 2. Player check — appeared as event.who (actor) in recent scene events
+        if await self._is_player_actor(candidate_name):
+            if self._has_identity_contract(candidate_name):
+                return EntityClass.PLAYER_SHADOW
+            return EntityClass.PLAYER_NO_CONTRACT
+
+        return EntityClass.NOVEL
+
+    def _is_known_place(self, name: str) -> bool:
+        """Return True if name fuzzy-matches a canonical city-pack place."""
+        if not self._place_names_cache:
+            return False
+        return any(
+            _name_similarity(name, place) >= 0.88
+            for place in self._place_names_cache
+        )
+
+    async def _is_player_actor(self, candidate_name: str) -> bool:
+        """Return True if this name appears as an event actor (event.who) in any
+        known session's recent events. Event actors are live or recent human players."""
+        for session_id in self._sessions:
+            try:
+                scene = await self._ww.get_scene(session_id)
+                for event in scene.recent_events_here:
+                    if _name_similarity(event.who, candidate_name) >= _TETHER_THRESHOLD:
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _has_identity_contract(self, name: str) -> bool:
+        """Return True if an identity contract file exists for this player.
+
+        Contract files live at: residents/_contracts/{normalized_name}.json
+        A contract signals explicit consent to be twinned as a federation resident.
+        Format: {"name": "...", "consent": true, "non_negotiables": ["..."], "ts": "..."}
+        """
+        normalized = re.sub(r"[^a-z0-9_]", "_", name.lower())
+        contract = self._residents_dir / "_contracts" / f"{normalized}.json"
+        if not contract.exists():
+            return False
+        try:
+            data = json.loads(contract.read_text(encoding="utf-8"))
+            return bool(data.get("consent"))
+        except Exception:
+            return False
+
+    async def _scaffold_pending_review(
+        self, name: str, context_lines: list[str], entity_class: EntityClass
+    ) -> None:
+        """Write a minimal identity stub to _pending_review/ for steward curation.
+
+        Static entities get a soul stub and an entity_type annotation but are NOT
+        added to the spawn queue. A steward reviews pending_review/ and decides:
+          - approve as static backdrop (voice but no movement loop)
+          - reclassify as mobile person (promote to full resident)
+          - dismiss (delete the stub)
+        """
+        pending_dir = self._residents_dir / "_pending_review" / name.lower()
+        if pending_dir.exists():
+            logger.debug("[doula] %s already in pending review, skipping", name)
+            return
+
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        (pending_dir / "IDENTITY.md").write_text(
+            f"# {name}\n\n"
+            f"- **entity_type:** {entity_class.value}\n"
+            f"- **Spawned-By:** doula (pending review)\n"
+            f"- **Spawned-At:** {ts}\n"
+            f"- **Classification:** {entity_class.value} — matched canonical city-pack geography\n"
+            f"- **Review:** approve (static backdrop), reclassify (full resident), or dismiss\n",
+            encoding="utf-8",
+        )
+        # Minimal soul stub from context evidence — enough for steward to evaluate
+        if context_lines:
+            context_prose = "\n".join(f"- {s}" for s in context_lines[:5] if s)
+            (pending_dir / "SOUL_STUB.md").write_text(
+                f"# {name} — narrative evidence\n\n{context_prose}\n",
+                encoding="utf-8",
+            )
+        logger.info("[doula] %s → _pending_review/ (static entity, awaiting steward review)", name)
+
+    # ------------------------------------------------------------------
+    # Cold-start bootstrap
+    # ------------------------------------------------------------------
+
+    async def _default_entry_location(self) -> str | None:
+        """Return a random city-pack place name for initial placement.
+
+        Used when there are no tethered sessions to derive proximity from.
+        Falls back to a hardcoded SF neighbourhood if the cache is empty.
+        """
+        if self._place_names_cache:
+            return random.choice(list(self._place_names_cache))
+        return "Mission District"
+
+    async def _bootstrap_cold_start(self) -> None:
+        """Seed the very first resident when the world has no narrative history.
+
+        Generates a founding inhabitant using only the SF grounding context
+        (current time, weather, neighbourhood feel) — no narrative evidence yet.
+        This is the patient zero from whom the infection of agency spreads.
+        """
+        if not self._ledger.can_spawn():
+            return
+
+        location = await self._default_entry_location()
+        if not location:
+            logger.debug("[doula] cold start: no locations available, deferring")
+            return
+
+        # Build context from real-world SF grounding
+        context_lines: list[str] = [
+            f"This person lives and works somewhere in {location.replace('_', ' ')}, San Francisco.",
+            "They have been here long enough to feel at home — not a newcomer, not a fixture.",
+        ]
+        try:
+            grounding = await self._ww.get_grounding()
+            if grounding.get("datetime_str"):
+                context_lines.insert(0, f"It is {grounding['datetime_str']} in San Francisco.")
+            if grounding.get("weather_description"):
+                context_lines.append(f"Outside right now: {grounding['weather_description']}.")
+            if grounding.get("time_of_day"):
+                context_lines.append(f"The hour has that {grounding['time_of_day']} feeling.")
+        except Exception:
+            pass
+
+        # Generate a plausible SF resident name via LLM
+        try:
+            name_raw = await self._llm.complete(
+                system_prompt=(
+                    "You are naming the first resident of a living San Francisco story world. "
+                    "Generate exactly one plausible human name for a person who naturally "
+                    "inhabits this city — diverse, grounded, real. "
+                    "Reply with the name only. No explanation, no punctuation, no quotes. "
+                    "Example format: Maria Santos"
+                ),
+                user_prompt="\n".join(context_lines),
+                model=self._soul_model,
+                temperature=0.95,
+                max_tokens=10,
+            )
+        except Exception as e:
+            logger.warning("[doula] cold start: name generation failed: %s", e)
+            return
+
+        name = name_raw.strip().strip("\"'").strip()
+        if not self._looks_like_name(name):
+            logger.warning("[doula] cold start: generated name looks wrong: %r — skipping", name)
+            return
+
+        logger.info(
+            "[doula] cold start: seeding founding inhabitant %s at %s", name, location
+        )
+        await self._seed_and_spawn(
+            name,
+            context_lines,
+            entry_location=location,
+            entity_class=EntityClass.NOVEL,
+        )
 
     # ------------------------------------------------------------------
     # Find untethered character names — cross-referenced and weighted
@@ -229,7 +485,7 @@ class DoulaLoop:
             name = data["name"]
             mention_count = world_summary_text.lower().count(name.lower())
             if mention_count > 0:
-                data["weight"] += min(mention_count * 0.15, 0.6)   # cap the boost
+                data["weight"] += min(mention_count * 0.15, 0.6)  # cap the boost
                 # Pull the fact summaries that actually mention this name
                 for fact in world_facts:
                     if name.lower() in (fact.summary or "").lower():
@@ -246,8 +502,27 @@ class DoulaLoop:
         # Sort: highest narrative weight first
         candidates.sort(key=lambda x: x[1], reverse=True)
 
-        logger.debug("[doula] found %d weighted candidates", len(candidates))
+        if candidates:
+            top = ", ".join(f"{n} ({w:.2f})" for n, w, _ in candidates[:5])
+            logger.info("[doula] %d candidate(s) found: %s", len(candidates), top)
+        else:
+            logger.info("[doula] no candidates found this cycle")
         return candidates
+
+    def _read_contract_constraints(self, name: str) -> list[str]:
+        """Read non-negotiable identity traits from a player's identity contract.
+        These are prepended to the soul seed context so the LLM treats them as
+        foundational — the gravity well the twin drifts around, not through."""
+        normalized = re.sub(r"[^a-z0-9_]", "_", name.lower())
+        contract = self._residents_dir / "_contracts" / f"{normalized}.json"
+        try:
+            data = json.loads(contract.read_text(encoding="utf-8"))
+            items = data.get("non_negotiables", [])
+            if items:
+                return [f"[identity contract] {item}" for item in items]
+        except Exception:
+            pass
+        return []
 
     async def _safe_get_graph_facts(self, query: str):
         try:
@@ -264,24 +539,100 @@ class DoulaLoop:
             return []
 
     # Words that indicate a place or business rather than a character name.
-    _PLACE_WORDS: frozenset[str] = frozenset({
-        "market", "shop", "store", "street", "avenue", "road", "park",
-        "cafe", "bar", "restaurant", "hotel", "plaza", "square", "station",
-        "building", "center", "centre", "district", "alley", "lane",
-    })
+    _PLACE_WORDS: frozenset[str] = frozenset(
+        {
+            "market",
+            "shop",
+            "store",
+            "street",
+            "avenue",
+            "road",
+            "park",
+            "cafe",
+            "bar",
+            "restaurant",
+            "hotel",
+            "plaza",
+            "square",
+            "station",
+            "building",
+            "center",
+            "centre",
+            "district",
+            "alley",
+            "lane",
+        }
+    )
+
+    # Words that indicate a job title or role rather than a personal name.
+    _ROLE_WORDS: frozenset[str] = frozenset(
+        {
+            "janitor",
+            "manager",
+            "waiter",
+            "waitress",
+            "bartender",
+            "barista",
+            "officer",
+            "guard",
+            "doctor",
+            "nurse",
+            "teacher",
+            "driver",
+            "chef",
+            "clerk",
+            "cashier",
+            "receptionist",
+            "supervisor",
+            "director",
+            "owner",
+            "captain",
+            "sergeant",
+            "detective",
+            "inspector",
+            "dealer",
+            "vendor",
+            "courier",
+            "pilot",
+            "conductor",
+            "porter",
+            "attendant",
+            "worker",
+            "stranger",
+            "resident",
+            "visitor",
+            "tourist",
+            "customer",
+            "patron",
+            # Session/system role labels that leak into narrative events
+            "player",
+            "user",
+            "observer",
+            "newcomer",
+            "narrator",
+            "system",
+            "anonymous",
+            "agent",
+            "npc",
+            "character",
+            "citizen",
+        }
+    )
 
     @classmethod
     def _looks_like_name(cls, s: str) -> bool:
         """Rough filter: a character name is one or two capitalized words, no hyphens, no digits,
-        and does not end in a common location word."""
+        and does not contain a known place or role word."""
         if not s or len(s) < 3:
             return False
         # Must be one or two plain capitalized words (no hyphens, punctuation, digits)
-        if not re.fullmatch(r'[A-Z][a-z]+(?: [A-Z][a-z]+)?', s):
+        if not re.fullmatch(r"[A-Z][a-z]+(?: [A-Z][a-z]+)?", s):
             return False
-        # Reject if any word is a known place indicator
+        # Reject if any word is a known place or role indicator
         words = s.lower().split()
         if any(w in cls._PLACE_WORDS for w in words):
+            return False
+        if any(w in cls._ROLE_WORDS for w in words):
             return False
         return True
 
@@ -313,18 +664,32 @@ class DoulaLoop:
                 for person in scene.present:
                     role_lower = person.role.lower() if person.role else ""
                     if (
-                        _name_similarity(person.name, candidate_name) >= _TETHER_THRESHOLD
+                        _name_similarity(person.name, candidate_name)
+                        >= _TETHER_THRESHOLD
                         or _name_similarity(role_lower, name_lower) >= _TETHER_THRESHOLD
                     ):
                         logger.debug(
                             "[doula] %s already has an active session (%s), skipping",
-                            candidate_name, person.name,
+                            candidate_name,
+                            person.name,
                         )
                         return None
 
                 # Candidate appears in narrative events near a tethered agent — eligible.
+                # But first: if the candidate is the *actor* of recent events (the "who"),
+                # they have an active session of their own — do NOT spawn.
                 for event in scene.recent_events_here:
-                    if name_lower in event.summary.lower() or name_lower in event.who.lower():
+                    if _name_similarity(event.who, candidate_name) >= _TETHER_THRESHOLD:
+                        logger.debug(
+                            "[doula] %s appears as event actor, likely a live player — skipping",
+                            candidate_name,
+                        )
+                        return None
+                for event in scene.recent_events_here:
+                    if (
+                        name_lower in event.summary.lower()
+                        or name_lower in event.who.lower()
+                    ):
                         return scene.location or None
             except Exception:
                 continue
@@ -335,7 +700,14 @@ class DoulaLoop:
     # Seed SOUL.md and scaffold the new resident directory
     # ------------------------------------------------------------------
 
-    async def _seed_and_spawn(self, name: str, context_lines: list[str], *, entry_location: str | None = None) -> None:
+    async def _seed_and_spawn(
+        self,
+        name: str,
+        context_lines: list[str],
+        *,
+        entry_location: str | None = None,
+        entity_class: EntityClass = EntityClass.NOVEL,
+    ) -> None:
         # Enrich with a targeted name query — cheap, and catches anything the broad
         # discovery query missed about this specific character.
         extra_facts, extra_graph = await asyncio.gather(
@@ -344,7 +716,12 @@ class DoulaLoop:
         )
         extra_summaries = [f.summary for f in extra_facts + extra_graph if f.summary]
 
-        all_lines = list(dict.fromkeys(context_lines + extra_summaries))  # dedupe, preserve order
+        # For player shadows, prepend any non-negotiables from the identity contract
+        contract_constraints: list[str] = []
+        if entity_class == EntityClass.PLAYER_SHADOW:
+            contract_constraints = self._read_contract_constraints(name)
+
+        all_lines = list(dict.fromkeys(contract_constraints + context_lines + extra_summaries))
         context_prose = "\n".join(f"- {s}" for s in all_lines if s)
 
         user_prompt = f"Character: {name}\n\nWhat the world has recorded about them:\n{context_prose}"
@@ -372,13 +749,29 @@ class DoulaLoop:
         (identity_dir / "SOUL.md").write_text(soul_text.strip(), encoding="utf-8")
 
         ts = datetime.now(timezone.utc).isoformat()
+        origin = entity_class.value  # "novel", "player_shadow", etc.
         (identity_dir / "IDENTITY.md").write_text(
-            f"# {name}\n\n- **Spawned-By:** doula\n- **Spawned-At:** {ts}\n",
-            encoding="utf-8"
+            f"# {name}\n\n"
+            f"- **Spawned-By:** doula\n"
+            f"- **Spawned-At:** {ts}\n"
+            f"- **origin:** {origin}\n",
+            encoding="utf-8",
+        )
+
+        # Default tuning: wander enabled so novel agents explore the world.
+        # Residents can override by adding their own tuning.json.
+        default_tuning = {
+            "_comment": f"Auto-generated by doula for {name}",
+            "wander": {"enabled": True, "seconds": 420, "temperature": 0.85},
+        }
+        (identity_dir / "tuning.json").write_text(
+            json.dumps(default_tuning, indent=4, ensure_ascii=False), encoding="utf-8"
         )
 
         if entry_location:
-            (identity_dir / "entry_location.txt").write_text(entry_location, encoding="utf-8")
+            (identity_dir / "entry_location.txt").write_text(
+                entry_location, encoding="utf-8"
+            )
             logger.info("[doula] %s will enter at: %s", name, entry_location)
 
         self._ledger.record_spawn()
