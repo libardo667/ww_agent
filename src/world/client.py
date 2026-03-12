@@ -398,6 +398,21 @@ class WorldWeaverClient:
     # Real-world grounding + map movement
     # ------------------------------------------------------------------
 
+    async def get_place_names(self) -> set[str]:
+        """Return all canonical city-pack place names (locations + landmarks).
+
+        Used by the doula to classify candidates as static entities. Returns
+        a set of lowercase names for fast fuzzy-matching. Returns empty set
+        on failure — callers must handle gracefully.
+        """
+        try:
+            resp = await self._get("/api/world/place-names", timeout=10.0)
+            data = resp.json()
+            return {entry["name"] for entry in data.get("place_names", [])}
+        except Exception as e:
+            logger.debug("[place-names] fetch failed: %s", e)
+            return set()
+
     async def get_grounding(self) -> dict:
         """
         Fetch current SF time + weather from the worldweaver grounding endpoint.
