@@ -244,7 +244,7 @@ class FastLoop(BaseLoop):
             await self._do_move(dest, scene, all_location_names)
 
         elif slug_lower.startswith("chat:"):
-            message = slug[len("chat:"):].strip()
+            message = slug[len("chat:"):].strip().strip('"\'')
             if message:
                 await self._do_chat(message, scene)
 
@@ -335,7 +335,8 @@ class FastLoop(BaseLoop):
 
         # Chat reply opt-in
         if action.upper().startswith("REPLY:"):
-            reply_text = action[len("REPLY:"):].strip()
+            reply_text = action[len("REPLY:"):].strip().strip('"\'')
+
             try:
                 await self._ww.post_location_chat(
                     location=scene.location,
