@@ -1,0 +1,8 @@
+{
+  "name": "Levi",
+  "session_id": "player",
+  "consent": false,
+  "non_negotiables": [],
+  "ts": "2026-03-12T00:00:00",
+  "note": "Human player — do not spawn. Consent=false permanently protects from shadow/twin spawning."
+}
