@@ -18,6 +18,10 @@ _RE_SEND    = re.compile(r'\[SEND:\s*(.+?)\]', re.IGNORECASE)
 _RE_HOLD    = re.compile(r'\[HOLD:\s*(.+?)\]', re.IGNORECASE)
 _RE_DISCARD = re.compile(r'\[DISCARD:\s*(.+?)\]', re.IGNORECASE)
 
+# Doula poll detection
+_RE_POLL_ID  = re.compile(r'^Poll-ID:\s*(\S+)', re.MULTILINE)
+_RE_VOTE     = re.compile(r'\bVOTE:\s*(PERSON|PLACE)\b', re.IGNORECASE)
+
 # Cancellation heuristic for intent responses.
 # The agent can decline by saying nothing substantial, or using withdrawal language.
 _CANCEL_WORDS = re.compile(
@@ -161,6 +165,7 @@ class MailLoop(BaseLoop):
 
         prompt_parts.append(
             "\nFor each letter: decide whether to reply.\n"
+            "If you receive a system poll from The Doula about an entity, reply with exactly 'VOTE: PERSON' or 'VOTE: PLACE'.\n"
             "For each unsent letter: decide whether to send it, wait, or let it go.\n\n"
             "To reply: [REPLY TO: sender name | your reply]\n"
             "To send: [SEND: recipient name]\n"
@@ -251,6 +256,33 @@ class MailLoop(BaseLoop):
         letters: list[Letter],
         drafts: list[tuple[Path, str]],
     ) -> None:
+        # Before generic reply handling: intercept doula poll votes and post directly.
+        # The letter contains Poll-ID: <uuid>; the agent's response contains VOTE: PERSON/PLACE.
+        # We post to the API so vote tracking is durable — no inbox scanning required.
+        vote_match = _RE_VOTE.search(response)
+        if vote_match:
+            raw_vote = vote_match.group(1).upper()
+            api_vote = "AGENT" if raw_vote == "PERSON" else "STATIC"
+            for letter in letters:
+                poll_id_match = _RE_POLL_ID.search(letter.body)
+                if poll_id_match:
+                    poll_id = poll_id_match.group(1).strip()
+                    try:
+                        await self._ww.cast_doula_vote(
+                            poll_id=poll_id,
+                            voter_session_id=self._session_id,
+                            vote=api_vote,
+                        )
+                        logger.info(
+                            "[%s:mail] cast doula vote %s on poll %s",
+                            self.name, api_vote, poll_id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s:mail] doula vote failed (poll=%s): %s", self.name, poll_id, e
+                        )
+                    break  # one poll per mail cycle
+
         # Send replies
         for match in _RE_REPLY.finditer(response):
             sender_name = match.group(1).strip()

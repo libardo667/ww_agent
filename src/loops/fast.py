@@ -63,6 +63,7 @@ _CLASSIFIER_SYSTEM = (
     "  react: <what you feel like doing, ≤8 words>\n"
     "  move: <exact location name from the list>\n"
     "  chat: <what you say aloud, ≤20 words>\n"
+    "  city: <what you broadcast citywide, ≤20 words>\n"
     "  mail: <Name> | <what to write about, ≤6 words>\n"
     "  ground\n"
     "  introspect\n\n"
@@ -100,6 +101,7 @@ class FastLoop(BaseLoop):
         self._tuning = identity.tuning
         self._last_event_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_chat_ts: str = datetime.now(timezone.utc).isoformat()
+        self._last_city_chat_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_ground_ts: float = 0.0
         self._chat_cooldown_until: float = 0.0  # monotonic; set after posting chat
         self._first_boot = not working_memory.has_any()
@@ -144,6 +146,15 @@ class FastLoop(BaseLoop):
             except Exception as e:
                 logger.debug("[%s:fast] chat poll failed: %s", self.name, e)
 
+            try:
+                city_chat = await self._ww.get_location_chat("__city__", since=self._last_city_chat_ts)
+                others_city = [m for m in city_chat if m.session_id != self._session_id]
+                if others_city and time.monotonic() >= self._chat_cooldown_until:
+                    logger.info("[%s:fast] new city chat — firing", self.name)
+                    return
+            except Exception as e:
+                logger.debug("[%s:fast] city chat poll failed: %s", self.name, e)
+
             if elapsed >= proactive_seconds:
                 logger.info("[%s:fast] proactive fallback — no events for %.0fs", self.name, elapsed)
                 return
@@ -155,13 +166,27 @@ class FastLoop(BaseLoop):
     async def _gather_context(self) -> dict:
         scene = await self._ww.get_scene(self._session_id)
         new_chat: list[ChatMessage] = []
+        recent_chat: list[ChatMessage] = []
+        new_city_chat: list[ChatMessage] = []
+        recent_city_chat: list[ChatMessage] = []
         if scene.location:
             try:
+                # Fetch new messages (for trigger detection) and a broader history window
+                # (for context). The history gives the agent full conversational awareness
+                # rather than only seeing the last few lines since its last check.
                 new_chat = await self._ww.get_location_chat(scene.location, since=self._last_chat_ts)
                 if new_chat:
                     self._last_chat_ts = new_chat[-1].ts
+                recent_chat = await self._ww.get_location_chat(scene.location)
             except Exception as e:
                 logger.debug("[%s:fast] chat fetch failed: %s", self.name, e)
+        try:
+            new_city_chat = await self._ww.get_location_chat("__city__", since=self._last_city_chat_ts)
+            if new_city_chat:
+                self._last_city_chat_ts = new_city_chat[-1].ts
+            recent_city_chat = await self._ww.get_location_chat("__city__")
+        except Exception as e:
+            logger.debug("[%s:fast] city chat fetch failed: %s", self.name, e)
 
         # Most recent grounding from working memory
         grounding_text = ""
@@ -193,6 +218,9 @@ class FastLoop(BaseLoop):
         return {
             "scene": scene,
             "new_chat": new_chat,
+            "recent_chat": recent_chat,
+            "new_city_chat": new_city_chat,
+            "recent_city_chat": recent_city_chat,
             "grounding_text": grounding_text,
             "active_route": active_route,
             "adjacent_names": adjacent_names,
@@ -209,6 +237,9 @@ class FastLoop(BaseLoop):
     async def _decide_and_execute(self, context: dict) -> None:
         scene = context["scene"]
         new_chat = context["new_chat"]
+        recent_chat = context["recent_chat"]
+        new_city_chat = context["new_city_chat"]
+        recent_city_chat = context["recent_city_chat"]
         grounding_text = context["grounding_text"]
         active_route = context["active_route"]
         adjacent_names = context["adjacent_names"]
@@ -216,7 +247,7 @@ class FastLoop(BaseLoop):
 
         # --- Build classifier prompt ---
         classifier_user = self._build_classifier_prompt(
-            scene, new_chat, grounding_text, active_route, adjacent_names
+            scene, new_chat, new_city_chat, grounding_text, active_route, adjacent_names
         )
         classifier_system = _CLASSIFIER_SYSTEM.format(name=self._identity.name)
 
@@ -245,7 +276,7 @@ class FastLoop(BaseLoop):
 
         elif slug_lower.startswith("react:"):
             hint = slug[len("react:"):].strip()
-            await self._do_react(hint, scene, new_chat)
+            await self._do_react(hint, scene, new_chat, recent_chat, recent_city_chat)
 
         elif slug_lower.startswith("move:"):
             dest = slug[len("move:"):].strip()
@@ -255,6 +286,11 @@ class FastLoop(BaseLoop):
             message = slug[len("chat:"):].strip().strip('"\'')
             if message:
                 await self._do_chat(message, scene)
+
+        elif slug_lower.startswith("city:"):
+            message = slug[len("city:"):].strip().strip('"\'')
+            if message:
+                await self._do_city_chat(message)
 
         elif slug_lower.startswith("mail:"):
             mail_body = slug[len("mail:"):].strip()
@@ -273,13 +309,13 @@ class FastLoop(BaseLoop):
         else:
             # Unrecognized — treat as a react hint
             logger.debug("[%s:fast] unrecognized slug %r, treating as react", self.name, slug)
-            await self._do_react(slug, scene, new_chat)
+            await self._do_react(slug, scene, new_chat, recent_chat, recent_city_chat)
 
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
 
-    async def _do_react(self, hint: str, scene, new_chat: list) -> None:
+    async def _do_react(self, hint: str, scene, new_chat: list, recent_chat: list | None = None, recent_city_chat: list | None = None) -> None:
         """Narrative participation — what the old fast loop did, now guided by the hint."""
         others = [p for p in scene.present if p.name.lower() != self.name.lower()]
         present_lines = "\n".join(
@@ -313,24 +349,43 @@ class FastLoop(BaseLoop):
         if hint:
             parts.append(f"What you feel like doing: {hint}.")
 
-        if new_chat:
-            chat_lines = "\n".join(f"- {m.display_name}: \"{m.message}\"" for m in new_chat[-5:])
+        # Use full recent chat history for context (up to 20 messages), not just
+        # the new arrivals since last check. This gives the agent conversational
+        # awareness rather than just reacting to the last few lines in isolation.
+        chat_context = recent_chat[-20:] if recent_chat else new_chat[-20:]
+        if chat_context:
+            chat_lines = "\n".join(f"- {m.display_name}: \"{m.message}\"" for m in chat_context)
             parts.append(
                 f"Chat here:\n{chat_lines}\n\n"
                 "You can reply by starting your response with REPLY: followed by what you say. "
-                "Or ignore it and do something else."
+                "Or ignore it and do something else. Keep replies brief and in character — "
+                "don't repeat what's already been said."
             )
         else:
             parts.append("Respond naturally and briefly.")
 
+        # City-wide chat context (last 5 messages for awareness, not a firehose)
+        city_context = recent_city_chat[-5:] if recent_city_chat else []
+        if city_context:
+            city_lines = "\n".join(f"- {m.display_name}: \"{m.message}\"" for m in city_context)
+            parts.append(
+                f"City channel (heard citywide):\n{city_lines}\n\n"
+                "To broadcast to the whole city, start your response with CITY: followed by what you say."
+            )
+
         user_prompt = "\n\n".join(parts)
+
+        # When chat is present, nudge temperature up slightly for more varied replies.
+        react_temperature = self._tuning.fast_temperature
+        if chat_context:
+            react_temperature = min(1.0, react_temperature + 0.1)
 
         try:
             response = await self._llm.complete(
                 system_prompt=self._identity.soul_with_context,
                 user_prompt=user_prompt,
                 model=self._tuning.fast_model,
-                temperature=self._tuning.fast_temperature,
+                temperature=react_temperature,
                 max_tokens=self._tuning.fast_max_tokens,
             )
         except Exception as e:
@@ -344,13 +399,19 @@ class FastLoop(BaseLoop):
         # Chat reply opt-in
         if action.upper().startswith("REPLY:"):
             reply_text = action[len("REPLY:"):].strip().strip('"\'')
+            # Strip any embedded CITY: broadcast the LLM appended, route it separately
+            _city_m = re.search(r'\n+CITY:\s*', reply_text, re.IGNORECASE)
+            _city_from_reply = None
+            if _city_m:
+                _city_from_reply = reply_text[_city_m.end():].strip()
+                reply_text = reply_text[:_city_m.start()].strip()
 
             try:
                 await self._ww.post_location_chat(
                     location=scene.location,
                     session_id=self._session_id,
                     message=reply_text,
-                    display_name=self._identity.name,
+                    display_name=self._identity.display_name,
                 )
                 logger.info("[%s:fast] chat reply: %s", self.name, reply_text[:80])
                 # Advance past our own message and suppress re-triggering for a while
@@ -358,7 +419,23 @@ class FastLoop(BaseLoop):
                 self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
             except Exception as e:
                 logger.warning("[%s:fast] chat post failed: %s", self.name, e)
+            if _city_from_reply:
+                await self._do_city_chat(_city_from_reply)
             return
+
+        # City broadcast opt-in
+        if action.upper().startswith("CITY:"):
+            city_text = action[len("CITY:"):].strip().strip('"\'')
+            await self._do_city_chat(city_text)
+            return
+
+        # Strip any embedded CITY: broadcast suffix so it doesn't contaminate the
+        # narrator's context. The extracted broadcast is dispatched after the action.
+        _city_m2 = re.search(r'\n+CITY:\s*', action, re.IGNORECASE)
+        _city_from_action = None
+        if _city_m2:
+            _city_from_action = action[_city_m2.end():].strip()
+            action = action[:_city_m2.start()].strip()
 
         impression_text, action_text = self._extract_impression(action)
 
@@ -382,6 +459,9 @@ class FastLoop(BaseLoop):
                 )
         except Exception as e:
             logger.warning("[%s:fast] post_action failed: %s", self.name, e)
+
+        if _city_from_action:
+            await self._do_city_chat(_city_from_action)
 
     async def _do_move(self, destination: str, scene, all_location_names: list[str]) -> None:
         """Immediate movement — reactive, not timer-driven."""
@@ -420,7 +500,7 @@ class FastLoop(BaseLoop):
                 location=scene.location,
                 session_id=self._session_id,
                 message=message,
-                display_name=self._identity.name,
+                display_name=self._identity.display_name,
             )
             logger.info("[%s:fast] chat: %s", self.name, message[:80])
             # Advance past our own message and suppress re-triggering for a while
@@ -428,6 +508,23 @@ class FastLoop(BaseLoop):
             self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
         except Exception as e:
             logger.warning("[%s:fast] chat post failed: %s", self.name, e)
+
+    async def _do_city_chat(self, message: str) -> None:
+        """Broadcast a message to the citywide channel."""
+        if not message:
+            return
+        try:
+            await self._ww.post_location_chat(
+                location="__city__",
+                session_id=self._session_id,
+                message=message,
+                display_name=self._identity.display_name,
+            )
+            logger.info("[%s:fast] city broadcast: %s", self.name, message[:80])
+            self._last_city_chat_ts = datetime.now(timezone.utc).isoformat()
+            self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
+        except Exception as e:
+            logger.warning("[%s:fast] city chat post failed: %s", self.name, e)
 
     async def _do_mail(self, recipient: str, intent: str) -> None:
         """Stage a letter intent — mail loop writes the actual letter."""
@@ -508,6 +605,7 @@ class FastLoop(BaseLoop):
         self,
         scene,
         new_chat: list,
+        new_city_chat: list,
         grounding_text: str,
         active_route: dict | None,
         adjacent_names: list[str],
@@ -531,10 +629,15 @@ class FastLoop(BaseLoop):
             if events:
                 parts.append(f"Just happened: {events}")
 
-        # New chat
+        # New local chat
         if new_chat:
             chat_str = " / ".join(f"{m.display_name}: \"{m.message}\"" for m in new_chat[-3:])
             parts.append(f"Someone spoke: {chat_str}")
+
+        # New city chat
+        if new_city_chat:
+            city_str = " / ".join(f"{m.display_name}: \"{m.message}\"" for m in new_city_chat[-2:])
+            parts.append(f"City channel: {city_str}")
 
         # Own recent actions
         recent = self._working.recent(2)

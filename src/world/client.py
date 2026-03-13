@@ -467,6 +467,71 @@ class WorldWeaverClient:
             logger.debug("[place-names] fetch failed: %s", e)
             return set()
 
+    async def get_news(self) -> list[str]:
+        """
+        Fetch recent SF/Bay Area news headlines from the grounding endpoint.
+        Returns a list of headline strings (empty list on failure).
+        Cached server-side for 1 hour — safe to call every ground loop cycle.
+        """
+        try:
+            resp = await self._get("/api/world/grounding/news", timeout=8.0)
+            return [item["title"] for item in resp.json().get("headlines", [])]
+        except Exception as e:
+            logger.debug("[news] fetch failed: %s", e)
+            return []
+
+    # ------------------------------------------------------------------
+    # Doula polls — backend-tracked classification votes
+    # ------------------------------------------------------------------
+
+    async def create_doula_poll(
+        self,
+        candidate_name: str,
+        context_lines: list[str],
+        entry_location: str | None,
+        entity_class: str,
+        weight: float,
+        voters: list[str],
+        expires_in_seconds: int = 7200,
+    ) -> str:
+        """Create a poll on the backend. Returns the poll_id."""
+        resp = await self._post(
+            "/api/world/doula/polls",
+            {
+                "candidate_name": candidate_name,
+                "context_lines": context_lines,
+                "entry_location": entry_location,
+                "entity_class": entity_class,
+                "weight": weight,
+                "voters": voters,
+                "expires_in_seconds": expires_in_seconds,
+            },
+        )
+        return resp.json()["poll_id"]
+
+    async def get_doula_polls(self) -> list[dict]:
+        """Fetch all open (unresolved, unexpired) polls."""
+        try:
+            resp = await self._get("/api/world/doula/polls", timeout=10.0)
+            return resp.json().get("polls", [])
+        except Exception as e:
+            logger.debug("[doula-polls] fetch failed: %s", e)
+            return []
+
+    async def cast_doula_vote(
+        self, poll_id: str, voter_session_id: str, vote: str
+    ) -> None:
+        """Cast a vote on a poll. vote must be 'AGENT' or 'STATIC'."""
+        await self._post(
+            f"/api/world/doula/polls/{poll_id}/vote",
+            {"voter_session_id": voter_session_id, "vote": vote},
+        )
+
+    async def resolve_doula_poll(self, poll_id: str) -> dict:
+        """Resolve a poll and return the outcome dict."""
+        resp = await self._post(f"/api/world/doula/polls/{poll_id}/resolve", {})
+        return resp.json()
+
     async def get_grounding(self) -> dict:
         """
         Fetch current SF time + weather from the worldweaver grounding endpoint.

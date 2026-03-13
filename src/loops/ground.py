@@ -72,6 +72,7 @@ class GroundLoop(BaseLoop):
     async def _gather_context(self) -> dict:
         grounding: dict = {}
         location = "somewhere in the city"
+        news: list[str] = []
 
         try:
             grounding = await self._ww.get_grounding()
@@ -84,7 +85,12 @@ class GroundLoop(BaseLoop):
         except Exception as e:
             logger.warning("[%s:ground] scene fetch failed: %s", self.name, e)
 
-        return {"grounding": grounding, "location": location}
+        try:
+            news = await self._ww.get_news()
+        except Exception as e:
+            logger.debug("[%s:ground] news fetch failed: %s", self.name, e)
+
+        return {"grounding": grounding, "location": location, "news": news}
 
     async def _should_act(self, context: dict) -> bool:
         return bool(context.get("grounding"))
@@ -96,6 +102,7 @@ class GroundLoop(BaseLoop):
     async def _decide_and_execute(self, context: dict) -> None:
         grounding = context["grounding"]
         location = context["location"]
+        news = context.get("news", [])
         name = self._identity.name
 
         datetime_str = grounding.get("datetime_str", "")
@@ -107,9 +114,15 @@ class GroundLoop(BaseLoop):
         if weather_desc:
             world_line += f". Weather: {weather_desc}"
 
+        # Include at most one headline — enough to make the world feel alive
+        # without overwhelming a sensory grounding moment.
+        news_line = ""
+        if news:
+            news_line = f"\n\nIn the news today: {news[0]}."
+
         user_prompt = (
             f"You are {name}, currently at {location}.\n\n"
-            f"Right now in San Francisco: {world_line}.\n\n"
+            f"Right now in San Francisco: {world_line}.{news_line}\n\n"
             f"In one or two sentences, describe what {name} briefly notices about "
             f"the world at this moment — a glance at a phone, a look out the window, "
             f"a feeling in the air, the quality of light. "

@@ -166,6 +166,7 @@ async def main() -> None:
             tethered_names=tethered_names,
             known_session_ids=session_ids,
             soul_model=doula_model,
+            poll_interval_seconds=120.0,
         )
         doula_task = asyncio.create_task(doula.run(), name="doula")
         spawn_drain = asyncio.create_task(

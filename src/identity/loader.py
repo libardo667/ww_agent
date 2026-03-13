@@ -115,6 +115,11 @@ class ResidentIdentity:
     tuning: LoopTuning
 
     @property
+    def display_name(self) -> str:
+        """Human-readable name: 'fei_fei' → 'Fei Fei'."""
+        return " ".join(w.capitalize() for w in self.name.split("_"))
+
+    @property
     def soul_with_context(self) -> str:
         """soul + world briefing — use this as system_prompt for all LLM calls."""
         return f"{self.soul}\n\n{_WORLD_CONTEXT}"

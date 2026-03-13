@@ -103,46 +103,9 @@ class _SpawnLedger:
         self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-class _PollLedger:
-    def __init__(self, path: Path):
-        self._path = path
-
-    def _load(self) -> dict:
-        if self._path.exists():
-            try:
-                return json.loads(self._path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
-
-    def _save(self, data: dict) -> None:
-        self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-    def add_poll(self, name: str, payload: dict) -> None:
-        data = self._load()
-        if "polls" not in data:
-            data["polls"] = {}
-        data["polls"][name] = payload
-        self._save(data)
-
-    def get_all_polls(self) -> dict:
-        return self._load().get("polls", {})
-
-    def remove_poll(self, name: str) -> None:
-        data = self._load()
-        if "polls" in data and name in data["polls"]:
-            del data["polls"][name]
-            self._save(data)
-
-    def record_seen_letter(self, filename: str) -> None:
-        data = self._load()
-        if "seen_letters" not in data:
-            data["seen_letters"] = []
-        data["seen_letters"].append(filename)
-        self._save(data)
-
-    def is_letter_seen(self, filename: str) -> bool:
-        return filename in self._load().get("seen_letters", [])
+# _PollLedger removed — poll state is now tracked in the backend database.
+# See: POST /api/world/doula/polls, GET /api/world/doula/polls,
+#      POST /api/world/doula/polls/{id}/vote, POST /api/world/doula/polls/{id}/resolve
 
 
 # ---------------------------------------------------------------------------
@@ -191,9 +154,6 @@ class DoulaLoop:
         self._soul_model = soul_model
         self._ledger = _SpawnLedger(
             residents_dir / ".doula_spawns.json", max_spawns_per_day
-        )
-        self._poll_ledger = _PollLedger(
-            residents_dir / ".doula_polls.json"
         )
         self._running = False
         self._seen_candidates: set[str] = set()  # don't re-evaluate same name in same day
@@ -363,21 +323,38 @@ class DoulaLoop:
     async def _initiate_poll(
         self, name: str, context_lines: list[str], found_at: str | None, entity_class: EntityClass, weight: float
     ) -> None:
-        voters = []
-        for session_id in self._sessions:
-            if session_id == "system_doula": continue
-            voters.append(session_id)
-            
+        voters = [s for s in self._sessions if s != "system_doula"]
+
         if not voters:
             logger.info("[doula] No voters available for poll on %s — seeding directly", name)
             await self._seed_and_spawn(name, context_lines, entry_location=found_at, entity_class=entity_class)
             return
 
+        # Create the poll in the backend first so we have a poll_id to include in letters.
+        try:
+            poll_id = await self._ww.create_doula_poll(
+                candidate_name=name,
+                context_lines=context_lines,
+                entry_location=found_at,
+                entity_class=entity_class.value,
+                weight=weight,
+                voters=voters,
+                expires_in_seconds=7200,
+            )
+        except Exception as e:
+            logger.warning("[doula] failed to create backend poll for %s: %s — seeding directly", name, e)
+            await self._seed_and_spawn(name, context_lines, entry_location=found_at, entity_class=entity_class)
+            return
+
+        # Notify each agent via letter. The Poll-ID header lets the mail loop
+        # post the vote directly to the API rather than replying by letter.
+        evidence = "\n".join(f"- {s}" for s in context_lines[:5])
         body = (
+            f"Poll-ID: {poll_id}\n\n"
             f"The Doula is asking for your input on a new presence named '{name}'.\n"
-            f"Please reply with exactly 'VOTE: PERSON' if you believe {name} is an active character/person, "
+            f"Reply with exactly 'VOTE: PERSON' if you believe {name} is an active character/person, "
             f"or 'VOTE: PLACE' if you believe {name} is a static building, business, or landmark.\n\n"
-            "Evidence we have:\n" + "\n".join(f"- {s}" for s in context_lines[:5])
+            f"Evidence we have:\n{evidence}"
         )
 
         for voter in voters:
@@ -387,84 +364,55 @@ class DoulaLoop:
                     from_name="The Doula", to_agent=agent_name, body=body, session_id="system_doula"
                 )
             except Exception as e:
-                logger.warning("[doula] Failed to send poll to %s: %s", voter, e)
+                logger.warning("[doula] Failed to send poll letter to %s: %s", voter, e)
 
-        expires_at = datetime.now(timezone.utc).timestamp() + 3600 * 2  # 2 hours TTL
-        self._poll_ledger.add_poll(name, {
-            "name": name,
-            "context_lines": context_lines,
-            "entry_location": found_at,
-            "entity_class": entity_class.value,
-            "weight": weight,
-            "expires_at": expires_at,
-            "voters": voters,
-            "votes": {}
-        })
-        logger.info("[doula] Initiated poll for %s with %d AI voters", name, len(voters))
+        logger.info("[doula] Initiated poll %s for '%s' with %d voters", poll_id, name, len(voters))
 
     async def _check_polls(self) -> None:
-        polls = self._poll_ledger.get_all_polls()
+        """Check open backend polls; resolve any that are expired or fully voted."""
+        try:
+            polls = await self._ww.get_doula_polls()
+        except Exception as e:
+            logger.warning("[doula] Failed to fetch open polls: %s", e)
+            return
+
         if not polls:
             return
 
-        # 1. Fetch Doula inbox for replies
-        try:
-            inbox = await self._ww.get_player_inbox("system_doula")
-            for letter in inbox:
-                if self._poll_ledger.is_letter_seen(letter.filename):
-                    continue
-                    
-                match = re.search(r"from_(.+?)_\d", letter.filename)
-                if not match: 
-                    self._poll_ledger.record_seen_letter(letter.filename)
-                    continue
-                    
-                sender = match.group(1).lower()
-                vote_type = None
-                
-                body_upper = letter.body.upper()
-                if "VOTE: PERSON" in body_upper:
-                    vote_type = "AGENT"
-                elif "VOTE: PLACE" in body_upper:
-                    vote_type = "STATIC"
-                
-                if vote_type:
-                    # Map the sender agent to the session_id format
-                    session_sender = f"agent-{sender}"
-                    # Apply vote to the first poll that is waiting for this sender
-                    for poll_name, poll in polls.items():
-                        if session_sender in poll["voters"] and sender not in poll["votes"]:
-                            poll["votes"][sender] = vote_type
-                            self._poll_ledger.add_poll(poll_name, poll)
-                            logger.info("[doula] Recorded %s vote from %s for %s", vote_type, sender, poll_name)
-                            break
+        for poll in polls:
+            poll_id = poll["poll_id"]
+            votes = poll["votes"]
+            voters = poll["voters"]
+            name = poll["candidate_name"]
 
-                self._poll_ledger.record_seen_letter(letter.filename)
-        except Exception as e:
-            logger.warning("[doula] Failed to check polls inbox: %s", e)
+            all_voted = len(votes) >= len(voters) > 0
+            if not all_voted:
+                continue  # still waiting — expiry handled server-side
 
-        # 2. Resolve expired or fully-voted polls
-        now = datetime.now(timezone.utc).timestamp()
-        
-        # reload polls state before resolving
-        polls = self._poll_ledger.get_all_polls()
-        for poll_name, poll in list(polls.items()):
-            if now > poll["expires_at"] or len(poll["votes"]) >= len(poll["voters"]):
-                agent_votes = sum(1 for v in poll["votes"].values() if v == "AGENT")
-                static_votes = sum(1 for v in poll["votes"].values() if v == "STATIC")
-                
-                logger.info("[doula] Poll for %s resolved: %d AGENT, %d STATIC", poll_name, agent_votes, static_votes)
-                self._poll_ledger.remove_poll(poll_name)
-                
-                if static_votes > agent_votes or (static_votes > 0 and static_votes == agent_votes):
-                    await self._inject_place_node(poll_name, poll["context_lines"])
-                else:
-                    await self._seed_and_spawn(
-                        poll_name, 
-                        poll["context_lines"], 
-                        entry_location=poll.get("entry_location"), 
-                        entity_class=EntityClass(poll["entity_class"])
-                    )
+            try:
+                result = await self._ww.resolve_doula_poll(poll_id)
+            except Exception as e:
+                logger.warning("[doula] Failed to resolve poll %s: %s", poll_id, e)
+                continue
+
+            outcome = result.get("outcome", "agent")
+            agent_votes = result.get("agent_votes", 0)
+            static_votes = result.get("static_votes", 0)
+            logger.info(
+                "[doula] Poll %s resolved: '%s' → %s (%d AGENT, %d STATIC)",
+                poll_id, name, outcome, agent_votes, static_votes,
+            )
+            self._seen_candidates.add(name)
+
+            if outcome == "static":
+                await self._inject_place_node(name, poll["context_lines"])
+            else:
+                await self._seed_and_spawn(
+                    name,
+                    poll["context_lines"],
+                    entry_location=poll.get("entry_location"),
+                    entity_class=EntityClass(poll["entity_class"]),
+                )
 
     # ------------------------------------------------------------------
     # Entity classification
@@ -743,6 +691,27 @@ class DoulaLoop:
             "district",
             "alley",
             "lane",
+            # SF-specific and system entity terms
+            "channel",  # e.g. "City Channel" — virtual broadcast system
+            "mission",  # The Mission (neighbourhood)
+            "bay",      # The Bay, Bay Area
+            "neighborhood",
+            "neighbourhood",
+            "corridor",
+            "wharf",
+            "heights",
+            "valley",
+        }
+    )
+
+    # Known virtual/system entity names that should never be spawned as characters.
+    # These are caught before the LLM classification and poll stages.
+    _SYSTEM_ENTITY_NAMES: frozenset[str] = frozenset(
+        {
+            "city channel",
+            "the city",
+            "the bay",
+            "the mission",
         }
     )
 
@@ -806,6 +775,9 @@ class DoulaLoop:
         """Rough filter: a character name is one or two capitalized words, no hyphens, no digits,
         and does not contain a known place or role word."""
         if not s or len(s) < 3:
+            return False
+        # Reject known virtual/system entity names before any other checks
+        if s.lower() in cls._SYSTEM_ENTITY_NAMES:
             return False
         # Must be one or two plain capitalized words (no hyphens, punctuation, digits)
         if not re.fullmatch(r"[A-Z][a-z]+(?: [A-Z][a-z]+)?", s):
