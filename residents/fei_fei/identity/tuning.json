@@ -19,7 +19,7 @@
     },
     "wander": {
         "enabled": true,
-        "seconds": 480,
+        "seconds": 240,
         "temperature": 0.75
     },
     "mail": {

@@ -2,7 +2,7 @@
     "home_location": "Western Addition",
     "wander": {
         "enabled": true,
-        "seconds": 420,
+        "seconds": 180,
         "temperature": 0.9
     },
     "ground": {

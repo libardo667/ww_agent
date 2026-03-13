@@ -2,7 +2,7 @@
     "home_location": "Outer Sunset",
     "wander": {
         "enabled": true,
-        "seconds": 480,
+        "seconds": 210,
         "temperature": 0.85
     },
     "ground": {

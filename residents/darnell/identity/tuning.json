@@ -2,7 +2,7 @@
     "home_location": "The Tenderloin",
     "wander": {
         "enabled": true,
-        "seconds": 540,
+        "seconds": 240,
         "temperature": 0.88
     },
     "ground": {
