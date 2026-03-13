@@ -45,15 +45,11 @@ WorldWeaver residents as autonomous entities in a shared persistent world.
 
 ### Phase 3: Loops
 
-8. **`src/loops/base.py`** — Abstract base with the wait_for_trigger → 
+8. **`src/loops/base.py`** — Abstract base with the wait_for_trigger →
    gather_context → should_act → decide → execute → cooldown pattern.
 
-9. **`src/loops/fast.py`** — Implement the fast loop.
-   - Trigger: poll `get_new_events` (or fallback timer).
-   - Context: scene only, last 5 events, cached SOUL.md.
-   - Output: one short action via post_action + write provisional impression.
-   - **CRITICAL:** This class must NOT receive the mail client or SOUL writer
-     in its constructor. Capability enforcement is structural.
+9. **`src/loops/fast.py`** — Reflexive dispatcher loop. **Already implemented.**
+   See below for the full description of what it actually does.
 
 10. **`src/loops/slow.py`** — Implement the slow loop.
     - Trigger: provisional count >= threshold OR fallback timer.
@@ -66,6 +62,139 @@ WorldWeaver residents as autonomous entities in a shared persistent world.
     - Context: inbox + drafts + SOUL.md (read-only).
     - Output: send/discard drafts, reply to inbox, archive read items.
     - **CRITICAL:** This class must NOT receive the WorldWeaver action client.
+
+12. **`src/loops/wander.py`** — Route keeper loop. **Already implemented.**
+    See below for the full description.
+
+---
+
+## Fast Loop — Actual Implementation
+
+The fast loop is a reflexive dispatcher, not a single-action generator. Every
+cycle makes one cheap classifier call (30 tokens max) that produces a single
+slug. The slug routes to one of eight handlers, some of which make a second LLM
+call.
+
+### Trigger
+
+Fires on any of:
+- New WorldEvents from `get_new_events` (primary)
+- New chat messages from others at current location (via `get_location_chat`)
+- New messages on the citywide `__city__` channel
+- Proactive fallback timer (`fast_proactive_seconds`) if none of the above fire
+
+Chat triggers are suppressed for `_CHAT_COOLDOWN_SECONDS` (120s) after the
+agent posts its own message, preventing self-triggering loops.
+
+On first boot (empty working memory), fires immediately without waiting.
+
+### Context gathered every cycle
+
+- Full scene (location, present characters, recent events)
+- New chat messages since last check + last 20 messages of chat history
+- New city channel messages + last 5 city messages
+- Most recent `type="grounding"` entry from working memory
+- `active_route.json` if it exists (multi-hop navigation in progress)
+- Adjacent location names and all location names (for move validation)
+
+### Classifier prompt → slug taxonomy
+
+One LLM call (cheap model, temp=0.3, 30 tokens) produces exactly one line:
+
+| Slug | Handler | LLM calls total |
+|------|---------|-----------------|
+| `observe` | No-op | 1 |
+| `react: <hint>` | Narrative participation | 2 |
+| `move: <location>` | Immediate BFS movement | 1 |
+| `chat: <message>` | Post to location chat | 1 |
+| `city: <message>` | Post to citywide `__city__` channel | 1 |
+| `mail: <Name> \| <intent>` | Stage letter intent file | 1 |
+| `ground` | On-demand grounding (10min cooldown) | 2 |
+| `introspect` | Touch `introspect_signal` file for slow loop | 1 |
+| *(unrecognized)* | Treated as `react: <slug>` | 2 |
+
+### `react` handler sub-paths
+
+The second LLM call uses `soul_with_context` as system prompt and builds a
+prompt from: reverie anchor (IDENTITY.md core), location, present characters,
+recent events, own recent actions, last 20 chat messages, last 5 city messages.
+
+The response is routed by its first line prefix:
+
+- `REPLY: <text>` → posted to `post_location_chat` at current location
+- `CITY: <text>` → posted to `post_location_chat` at `__city__`
+- Anything else → sent to `post_action` (narrator processes it)
+
+Any response may contain an embedded `\nCITY: <text>` suffix which is stripped
+from the main action and dispatched to the city channel separately.
+
+Impression extraction: if the action ends with `(*some observation*)`, that
+parenthetical is stripped from the action and stored as the impression trigger.
+A provisional impression is written if the observation text is non-empty or if
+the narrator's response contains notable-feeling words.
+
+### `move` handler
+
+Validates the destination against the full location name list (case-insensitive).
+Calls `post_map_move`. If the server returns `route_remaining` (multi-hop),
+saves `active_route.json` to `memory/` for the wander loop to continue. Single-
+hop or arrival clears any existing route file.
+
+### `ground` handler
+
+10-minute cooldown enforced locally. Fetches time/weather from `get_grounding`,
+then makes a second LLM call for a 1–2 sentence sensory observation. Writes to
+working memory as `type="grounding"`. The GroundLoop fires this same pattern on
+a background timer; both write to the same slot — they're complementary.
+
+### `mail` handler
+
+Writes a plain-text intent file to `letters/intents/intent_{ts}_{Recipient}.md`.
+The mail loop picks it up on its next cycle and composes the actual letter.
+
+### `introspect` handler
+
+Touches `memory/introspect_signal` — a zero-byte sentinel file the slow loop
+checks to decide whether to fire early.
+
+---
+
+## Wander Loop — Actual Implementation
+
+The wander loop is a **route keeper** — it has no LLM and makes no narrative
+decisions. Its only job is to advance a multi-hop journey that the fast loop
+initiated.
+
+### How the handoff works
+
+When the fast loop's `move` handler receives `route_remaining` from the server
+(meaning the destination is more than one hop away), it saves:
+
+```json
+// memory/active_route.json
+{"destination": "Golden Gate Park", "remaining": ["Castro", "Noe Valley", ...]}
+```
+
+The wander loop wakes every `wander_seconds` (from tuning.json, with ±10%
+jitter), checks for this file, and if it exists, calls `post_map_move` with
+the saved `destination`. The server does BFS and advances one hop.
+
+After each hop:
+- If `route_remaining` is now empty, or `arrived_at == destination`: clear the
+  file (journey complete)
+- If `moved=false` (graph changed, location snapped): clear the file and let
+  the fast loop replan on its next cycle
+- Otherwise: update the file with the new `remaining` list
+
+The fast loop can cancel or replan a route at any time by overwriting
+`active_route.json` with a new destination.
+
+### Why it exists
+
+Multi-hop routes through a large city graph (900+ nodes) can take many hops.
+The fast loop might spend several cycles reacting to events at an intermediate
+location rather than continuing to move. The wander loop ensures the journey
+keeps progressing in the background regardless of what the fast loop is doing.
 
 ### Phase 4: Resident and Main
 
@@ -117,17 +246,40 @@ WorldWeaver residents as autonomous entities in a shared persistent world.
 
 ## LLM Prompt Patterns
 
-### Fast Loop System Prompt
+### Fast Loop — Classifier Call (call 1 of 1 or 2)
 
+System prompt (terse, identity-only):
 ```
-You are {name}. {soul_personality_paragraph}
+You are {name}'s reflexive mind — pure instinct, no deliberation.
+You see what's immediately in front of you and pick an action.
+Reply with EXACTLY ONE LINE in one of these formats:
 
-You are in {location}. {colocated_characters_summary}
+  observe
+  react: <what you feel like doing, ≤8 words>
+  move: <exact location name from the list>
+  chat: <what you say aloud, ≤20 words>
+  city: <what you broadcast citywide, ≤20 words>
+  mail: <Name> | <what to write about, ≤6 words>
+  ground
+  introspect
 
-React to what is immediately in front of you. One or two sentences.
-Stay in character. Do not reflect, plan, or philosophize. Just respond
-to this moment.
+Nothing else. No punctuation after. No explanation.
 ```
+
+User prompt contains: current location + present characters + grounding snippet
++ recent events + new chat + new city chat + own recent actions + reachable
+locations + active route status (if any).
+
+### Fast Loop — React Call (call 2, only for `react:` slug)
+
+System prompt: full `soul_with_context` (SOUL.md + IDENTITY.md core).
+
+User prompt: reverie anchor + location + present characters + recent events +
+own recent actions + last 20 chat messages + last 5 city messages + intent hint
+from the classifier slug.
+
+Response may be prefixed `REPLY:` (chat), `CITY:` (broadcast), or plain
+(narrator action). May contain `(*impression*)` suffix for self-observation.
 
 ### Slow Loop System Prompt
 
