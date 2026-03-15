@@ -39,6 +39,7 @@ from src.identity.loader import ResidentIdentity
 from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
+from src.memory.reveries import ReverieDeck
 from src.memory.working import WorkingMemory
 from src.world.client import WorldWeaverClient, ChatMessage
 
@@ -46,9 +47,10 @@ logger = logging.getLogger(__name__)
 
 _ROUTE_FILE = "active_route.json"
 _INTROSPECT_SIGNAL = "introspect_signal"
-# After posting a chat message, suppress chat-triggered firing for this long.
-# Prevents the agent from talking to itself in a loop.
+# After posting to local chat, suppress local-chat-triggered firing for this long.
 _CHAT_COOLDOWN_SECONDS = 120.0
+# City channel cooldown — longer, since broadcasts go to everyone and echo loudly.
+_CITY_COOLDOWN_SECONDS = 600.0
 
 # Minimum gap (seconds) between on-demand ground calls from this loop.
 # The GroundLoop handles ambient grounding; we don't need to spam it.
@@ -67,6 +69,8 @@ _CLASSIFIER_SYSTEM = (
     "  mail: <Name> | <what to write about, ≤6 words>\n"
     "  ground\n"
     "  introspect\n\n"
+    "When someone spoke to you in the chat log, prefer `chat:` for a direct verbal reply. "
+    "Use `react:` only when you want to do something beyond a quick spoken response.\n\n"
     "Nothing else. No punctuation after. No explanation."
 )
 
@@ -90,6 +94,7 @@ class FastLoop(BaseLoop):
         session_id: str,
         working_memory: WorkingMemory,
         provisional: ProvisionalScratchpad,
+        reveries: ReverieDeck,
     ):
         super().__init__(identity.name, resident_dir)
         self._identity = identity
@@ -98,12 +103,16 @@ class FastLoop(BaseLoop):
         self._session_id = session_id
         self._working = working_memory
         self._provisional = provisional
+        self._reveries = reveries
         self._tuning = identity.tuning
         self._last_event_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_chat_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_city_chat_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_ground_ts: float = 0.0
-        self._chat_cooldown_until: float = 0.0  # monotonic; set after posting chat
+        self._chat_cooldown_until: float = 0.0     # local chat; monotonic
+        self._city_cooldown_until: float = 0.0     # city channel; separate + longer
+        self._last_local_sent: str = ""            # last message posted to local chat
+        self._last_city_sent: str = ""             # last message broadcast citywide
         self._first_boot = not working_memory.has_any()
         self._route_path = resident_dir / "memory" / _ROUTE_FILE
         self._signal_path = resident_dir / "memory" / _INTROSPECT_SIGNAL
@@ -257,7 +266,7 @@ class FastLoop(BaseLoop):
                 user_prompt=classifier_user,
                 model=self._tuning.fast_model,
                 temperature=0.3,
-                max_tokens=30,
+                max_tokens=80,
             )
         except Exception as e:
             logger.warning("[%s:fast] classifier failed: %s", self.name, e)
@@ -335,11 +344,13 @@ class FastLoop(BaseLoop):
             if own:
                 own_lines = "What you've been doing: " + " / ".join(own)
 
-        # Reverie anchor — core identity facts from IDENTITY.md, prepended before
-        # every action so the character remembers who they are even under drift.
+        # Reverie anchor — a live, personal image drawn from the deck the slow loop
+        # populates. Falls back to the static identity.core prose on cold start
+        # (before any slow loop firings have populated the deck).
         parts = []
-        if self._identity.core:
-            parts.append(self._identity.core)
+        anchor = self._reveries.random_pick() or self._identity.core
+        if anchor:
+            parts.append(anchor)
         parts.append(f"You're at {scene.location}.")
         parts.append(f"Present:\n{present_lines}")
         if event_lines:
@@ -358,8 +369,9 @@ class FastLoop(BaseLoop):
             parts.append(
                 f"Chat here:\n{chat_lines}\n\n"
                 "You can reply by starting your response with REPLY: followed by what you say. "
-                "Or ignore it and do something else. Keep replies brief and in character — "
-                "don't repeat what's already been said."
+                "Or ignore it and do something else.\n"
+                "If you reply, speak in 1-2 short sentences — casual, plain, the way a real "
+                "person actually talks. No metaphors, no atmospheric prose. Just words."
             )
         else:
             parts.append("Respond naturally and briefly.")
@@ -375,10 +387,13 @@ class FastLoop(BaseLoop):
 
         user_prompt = "\n\n".join(parts)
 
-        # When chat is present, nudge temperature up slightly for more varied replies.
+        # When chat is present, nudge temperature up slightly for more varied replies,
+        # and cap tokens tightly — chat replies should be brief utterances, not monologues.
         react_temperature = self._tuning.fast_temperature
+        react_max_tokens = self._tuning.fast_max_tokens
         if chat_context:
             react_temperature = min(1.0, react_temperature + 0.1)
+            react_max_tokens = min(react_max_tokens, 80)
 
         try:
             response = await self._llm.complete(
@@ -386,7 +401,7 @@ class FastLoop(BaseLoop):
                 user_prompt=user_prompt,
                 model=self._tuning.fast_model,
                 temperature=react_temperature,
-                max_tokens=self._tuning.fast_max_tokens,
+                max_tokens=react_max_tokens,
             )
         except Exception as e:
             logger.warning("[%s:fast] react LLM failed: %s", self.name, e)
@@ -495,6 +510,9 @@ class FastLoop(BaseLoop):
 
     async def _do_chat(self, message: str, scene) -> None:
         """Short reactive utterance posted to location chat."""
+        if time.monotonic() < self._chat_cooldown_until:
+            logger.debug("[%s:fast] local chat cooldown active — suppressing", self.name)
+            return
         try:
             await self._ww.post_location_chat(
                 location=scene.location,
@@ -503,15 +521,18 @@ class FastLoop(BaseLoop):
                 display_name=self._identity.display_name,
             )
             logger.info("[%s:fast] chat: %s", self.name, message[:80])
-            # Advance past our own message and suppress re-triggering for a while
             self._last_chat_ts = datetime.now(timezone.utc).isoformat()
             self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
+            self._last_local_sent = message
         except Exception as e:
             logger.warning("[%s:fast] chat post failed: %s", self.name, e)
 
     async def _do_city_chat(self, message: str) -> None:
         """Broadcast a message to the citywide channel."""
         if not message:
+            return
+        if time.monotonic() < self._city_cooldown_until:
+            logger.debug("[%s:fast] city cooldown active — suppressing broadcast", self.name)
             return
         try:
             await self._ww.post_location_chat(
@@ -522,7 +543,8 @@ class FastLoop(BaseLoop):
             )
             logger.info("[%s:fast] city broadcast: %s", self.name, message[:80])
             self._last_city_chat_ts = datetime.now(timezone.utc).isoformat()
-            self._chat_cooldown_until = time.monotonic() + _CHAT_COOLDOWN_SECONDS
+            self._city_cooldown_until = time.monotonic() + _CITY_COOLDOWN_SECONDS
+            self._last_city_sent = message
         except Exception as e:
             logger.warning("[%s:fast] city chat post failed: %s", self.name, e)
 
@@ -638,6 +660,12 @@ class FastLoop(BaseLoop):
         if new_city_chat:
             city_str = " / ".join(f"{m.display_name}: \"{m.message}\"" for m in new_city_chat[-2:])
             parts.append(f"City channel: {city_str}")
+
+        # Last messages sent — so the agent doesn't repeat itself
+        if self._last_local_sent:
+            parts.append(f"You last said here: \"{self._last_local_sent}\"")
+        if self._last_city_sent:
+            parts.append(f"Your last city broadcast: \"{self._last_city_sent}\"")
 
         # Own recent actions
         recent = self._working.recent(2)

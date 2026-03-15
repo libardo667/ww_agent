@@ -9,7 +9,7 @@ from pathlib import Path
 from src.identity.loader import ResidentIdentity
 from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
-from src.world.client import Letter, WorldWeaverClient
+from src.world.client import DM, WorldWeaverClient
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ _CANCEL_WORDS = re.compile(
     re.IGNORECASE,
 )
 _LETTER_MIN_WORDS = 20  # fewer than this = treat as a non-response / cancellation
+_DM_COOLDOWN_SECONDS = 3600.0  # minimum gap between letters to the same recipient
 
 
 class MailLoop(BaseLoop):
@@ -64,6 +65,8 @@ class MailLoop(BaseLoop):
         self._llm = llm
         self._session_id = session_id
         self._tuning = identity.tuning
+        # Per-recipient: (last_excerpt, cooldown_until_monotonic)
+        self._last_sent_to: dict[str, tuple[str, float]] = {}
         self._drafts_dir = resident_dir / "letters" / "drafts"
         self._sent_dir = resident_dir / "letters" / "drafts" / "sent"
         self._inbox_dir = resident_dir / "letters" / "inbox"
@@ -103,7 +106,7 @@ class MailLoop(BaseLoop):
         return False
 
     async def _gather_context(self) -> dict:
-        letters: list[Letter] = []
+        letters: list[DM] = []
         try:
             letters = await self._ww.get_inbox(self.name)
         except Exception as e:
@@ -122,7 +125,7 @@ class MailLoop(BaseLoop):
     # ------------------------------------------------------------------
 
     async def _decide_and_execute(self, context: dict) -> None:
-        letters: list[Letter] = context["letters"]
+        letters: list[DM] = context["letters"]
         draft_paths: list[Path] = context["drafts"]
         intent_paths: list[Path] = context["intents"]
 
@@ -195,20 +198,36 @@ class MailLoop(BaseLoop):
         Present a slow-loop intent to the agent as a gentle question.
         If they write something substantial, send it. If they demur, discard the intent.
         """
+        import time as _time
         recipient = self._parse_draft_recipient(content)
         context_excerpt = self._parse_intent_context(content)
+
+        # Per-recipient cooldown — don't send another letter if one went recently.
+        last_excerpt, cooldown_until = self._last_sent_to.get(recipient, ("", 0.0))
+        if _time.monotonic() < cooldown_until:
+            intent_path.unlink(missing_ok=True)
+            logger.info(
+                "[%s:mail] intent for %s suppressed — sent too recently", self.name, recipient
+            )
+            return
 
         # Frame the question naturally — slightly formal, like a moment of pause,
         # but clearly an invitation rather than a command.
         # The agent can write a letter or simply decline.
+        last_sent_line = (
+            f"The last thing you wrote to {recipient}: \"{last_excerpt[:120]}\"\n\n"
+            if last_excerpt else ""
+        )
         if context_excerpt:
             user_prompt = (
+                f"{last_sent_line}"
                 f"{context_excerpt}\n\n"
                 f"Is there something you'd like to say to {recipient}? "
                 f"If so, write it here. If not, just say so."
             )
         else:
             user_prompt = (
+                f"{last_sent_line}"
                 f"{recipient} has been on your mind.\n\n"
                 f"Is there something you'd like to say to them? "
                 f"If so, write it here. If not, just say so."
@@ -242,6 +261,10 @@ class MailLoop(BaseLoop):
                 session_id=self._session_id,
             )
             intent_path.unlink(missing_ok=True)
+            self._last_sent_to[recipient] = (
+                response[:120],
+                _time.monotonic() + _DM_COOLDOWN_SECONDS,
+            )
             logger.info("[%s:mail] sent letter to %s from intent", self.name, recipient)
         except Exception as e:
             logger.warning("[%s:mail] send to %s failed: %s", self.name, recipient, e)
@@ -253,7 +276,7 @@ class MailLoop(BaseLoop):
     async def _process_mail_response(
         self,
         response: str,
-        letters: list[Letter],
+        letters: list[DM],
         drafts: list[tuple[Path, str]],
     ) -> None:
         # Before generic reply handling: intercept doula poll votes and post directly.
@@ -312,6 +335,7 @@ class MailLoop(BaseLoop):
             # No match = implicit hold — leave it
 
     async def _send_draft(self, path: Path, content: str) -> None:
+        import time as _time
         recipient = self._parse_draft_recipient(content)
         body = self._parse_draft_body(content)
 
@@ -324,6 +348,10 @@ class MailLoop(BaseLoop):
             )
             self._sent_dir.mkdir(parents=True, exist_ok=True)
             path.rename(self._sent_dir / path.name)
+            self._last_sent_to[recipient] = (
+                body[:120],
+                _time.monotonic() + _DM_COOLDOWN_SECONDS,
+            )
             logger.info("[%s:mail] sent letter to %s", self.name, recipient)
         except Exception as e:
             logger.warning("[%s:mail] send to %s failed: %s", self.name, recipient, e)
@@ -369,7 +397,7 @@ class MailLoop(BaseLoop):
                 in_context = True
         return "\n".join(context_lines).strip()
 
-    def _find_reply_session(self, sender_name: str, letters: list[Letter]) -> str | None:
+    def _find_reply_session(self, sender_name: str, letters: list[DM]) -> str | None:
         """Look for Reply-To-Session header in the letter from this sender."""
         for letter in letters:
             if sender_name.lower() in letter.filename.lower():

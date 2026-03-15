@@ -1,0 +1,27 @@
+{
+    "_comment": "Meiying: slow to act, deep reflector, writes rarely but deliberately.",
+    "fast": {
+        "cooldown_seconds": 180,
+        "act_threshold": 0.75,
+        "max_context_events": 5,
+        "temperature": 0.7,
+        "max_tokens": 150
+    },
+    "slow": {
+        "impression_threshold": 2,
+        "fallback_seconds": 300,
+        "max_context_events": 20,
+        "temperature": 0.6,
+        "max_tokens": 500
+    },
+    "mail": {
+        "enabled": true,
+        "poll_seconds": 600,
+        "send_delay_seconds": 600,
+        "discard_threshold": 0.7,
+        "max_letter_words": 300,
+        "temperature": 0.5,
+        "max_tokens": 400
+    },
+    "home_location": "Clement Street"
+}

@@ -12,6 +12,7 @@ from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.retrieval import LongTermMemory
+from src.memory.reveries import ReverieDeck
 from src.memory.working import WorkingMemory
 from src.world.client import WorldWeaverClient, world_facts_to_prose
 
@@ -92,6 +93,7 @@ class SlowLoop(BaseLoop):
         working_memory: WorkingMemory,
         provisional: ProvisionalScratchpad,
         long_term: LongTermMemory,
+        reveries: ReverieDeck,
     ):
         super().__init__(identity.name, resident_dir)
         self._identity = identity
@@ -101,6 +103,7 @@ class SlowLoop(BaseLoop):
         self._working = working_memory
         self._provisional = provisional
         self._long_term = long_term
+        self._reveries = reveries
         self._tuning = identity.tuning
         self._decisions_dir = resident_dir / "decisions"
         self._decisions_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +372,11 @@ class SlowLoop(BaseLoop):
             })
             self._long_term.store(reflection[:400], tags=tags, source="slow_reflection")
 
+        # Extract a live reverie — a specific sensory/emotional image the character
+        # carries forward. Populates the deck the fast loop draws from as a varied
+        # anchor instead of repeating the same static identity.core prose every cycle.
+        await self._maybe_write_reverie(reflection)
+
     # ------------------------------------------------------------------
     # Satiation: break feedback spirals on repeated topics
     # ------------------------------------------------------------------
@@ -631,6 +639,33 @@ class SlowLoop(BaseLoop):
             "[%s:slow] soul collapsed: %d chars soul + %d chars notes → %d chars",
             self.name, len(soul_text), len(notes_text), len(refined),
         )
+
+    async def _maybe_write_reverie(self, reflection: str) -> None:
+        """
+        Extract one vivid sensory/emotional image from the reflection and add
+        it to the reverie deck. These become the fast loop's live anchor —
+        personal, varied, and evolving rather than the same static prose.
+        """
+        try:
+            reverie = await self._llm.complete(
+                system_prompt=(
+                    f"You are reading {self.name}'s private reflection. "
+                    "Extract one vivid, specific sensory or emotional image from it — "
+                    "something they noticed, felt, or will carry with them. "
+                    "Write it in first person, under 20 words. No explanation. "
+                    "If there is nothing specific and sensory, reply with exactly: nothing"
+                ),
+                user_prompt=reflection[:800],
+                model=self._tuning.slow_subconscious_model,
+                temperature=0.7,
+                max_tokens=35,
+            )
+            reverie = reverie.strip().strip("\"'.,")
+            if reverie and not reverie.lower().startswith("nothing"):
+                self._reveries.add(reverie)
+                logger.debug("[%s:slow] reverie: %s", self.name, reverie[:70])
+        except Exception as e:
+            logger.debug("[%s:slow] reverie extraction failed: %s", self.name, e)
 
     async def _cooldown(self) -> None:
         await asyncio.sleep(5.0)

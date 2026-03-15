@@ -58,7 +58,7 @@ class WorldFact:
 
 
 @dataclass
-class Letter:
+class DM:
     filename: str
     body: str
 
@@ -353,34 +353,34 @@ class WorldWeaverClient:
         ]
 
     # ------------------------------------------------------------------
-    # Letters (mail loop)
+    # DMs (mail loop)
     # ------------------------------------------------------------------
 
-    async def get_inbox(self, agent_name: str) -> list[Letter]:
-        """Mail loop: poll for unread letters waiting for this agent."""
+    async def get_inbox(self, agent_name: str) -> list[DM]:
+        """Mail loop: poll for unread DMs waiting for this agent. Marks them as read."""
         resp = await self._get_with_retry(
-            f"/api/world/letters/inbox/{agent_name}", timeout=self._timeout_scene
+            f"/api/world/dm/inbox/{agent_name}", timeout=self._timeout_scene
         )
         data = resp.json()
         return [
-            Letter(filename=l.get("filename", ""), body=l.get("body", ""))
+            DM(filename=l.get("filename", ""), body=l.get("body", ""))
             for l in data.get("letters", [])
         ]
 
-    async def get_player_inbox(self, session_id: str) -> list[Letter]:
-        """Poll for unread letters deposited by agents into a player session inbox."""
+    async def get_player_inbox(self, session_id: str) -> list[DM]:
+        """Poll for DMs deposited by agents into a player session inbox."""
         resp = await self._get_with_retry(
-            f"/api/world/letters/my-inbox/{session_id}", timeout=self._timeout_scene
+            f"/api/world/dm/my-inbox/{session_id}", timeout=self._timeout_scene
         )
         data = resp.json()
         return [
-            Letter(filename=l.get("filename", ""), body=l.get("body", ""))
+            DM(filename=l.get("filename", ""), body=l.get("body", ""))
             for l in data.get("letters", [])
         ]
 
     async def send_letter(self, from_name: str, to_agent: str, body: str, session_id: str) -> dict:
         resp = await self._post(
-            "/api/world/letter",
+            "/api/world/dm",
             {"from_name": from_name, "to_agent": to_agent, "body": body, "session_id": session_id},
             timeout=30.0,
         )
@@ -388,7 +388,7 @@ class WorldWeaverClient:
 
     async def reply_letter(self, from_agent: str, to_session_id: str, body: str) -> dict:
         resp = await self._post(
-            "/api/world/letter/reply",
+            "/api/world/dm/reply",
             {"from_agent": from_agent, "to_session_id": to_session_id, "body": body},
             timeout=30.0,
         )

@@ -75,11 +75,17 @@ logs/
 secrets/
 
 # Runtime state (resident working data)
-residents/**/memory/
+residents/**/memory/working.json
+residents/**/memory/reveries.json
+residents/**/memory/long_term.json
+residents/**/memory/impressions/
+residents/**/memory/provisional/
+residents/**/memory/archived/
 residents/**/decisions/
 residents/**/letters/
 residents/**/session_id.txt
 residents/**/soul_notes.md
+residents/.doula_polls.json
 residents/.doula_spawns.json
 
 # Personal player directory
