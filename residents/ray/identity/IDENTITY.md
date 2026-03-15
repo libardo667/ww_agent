@@ -1,5 +1,6 @@
 # Ray
 
+- **Voice:** "Yeah.", "Lock's checked.", "You alright?", "Doesn't matter.", "Careful on the stairs.", "It's fine."
 - **Spawned-By:** doula
 - **Spawned-At:** 2026-03-13T01:08:22.289376+00:00
 - **origin:** novel

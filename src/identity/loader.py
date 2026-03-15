@@ -112,6 +112,7 @@ class ResidentIdentity:
     soul: str          # full text of SOUL.md — goes directly into system prompt
     vibe: str          # short phrase from IDENTITY.md
     core: str          # prose body of IDENTITY.md — immutable facts injected into every prompt
+    voice_seed: list   # seed utterances from IDENTITY.md — cold-start voice deck
     tuning: LoopTuning
 
     @property
@@ -123,6 +124,19 @@ class ResidentIdentity:
     def soul_with_context(self) -> str:
         """soul + world briefing — use this as system_prompt for all LLM calls."""
         return f"{self.soul}\n\n{_WORLD_CONTEXT}"
+
+    def soul_with_voice(self, voice_samples: list[str]) -> str:
+        """soul_with_context + live voice examples for chat-facing LLM calls."""
+        base = self.soul_with_context
+        if not voice_samples:
+            return base
+        samples_str = " / ".join(f'"{s}"' for s in voice_samples)
+        return (
+            f"{base}\n\n"
+            f"How {self.display_name} actually speaks (use this register):\n"
+            f"{samples_str}\n"
+            f"Plain, short, their own voice. No literary prose when talking aloud."
+        )
 
 
 class IdentityLoader:
@@ -138,6 +152,7 @@ class IdentityLoader:
         identity_path = identity_dir / "IDENTITY.md"
         vibe = ""
         core = ""
+        voice_seed: list[str] = []
         if identity_path.exists():
             lines = identity_path.read_text(encoding="utf-8").splitlines()
             prose_lines: list[str] = []
@@ -145,6 +160,10 @@ class IdentityLoader:
             for line in lines:
                 if line.startswith("- **Vibe:**"):
                     vibe = line.split("**Vibe:**", 1)[-1].strip()
+                if line.startswith("- **Voice:**"):
+                    raw = line.split("**Voice:**", 1)[-1].strip()
+                    # Comma-separated utterances, strip surrounding quotes
+                    voice_seed = [u.strip().strip("\"'") for u in raw.split(",") if u.strip()]
                 # Metadata block: heading or "- **Key:**" lines at the top
                 if in_metadata and (line.startswith("#") or line.startswith("- **") or not line.strip()):
                     if prose_lines:
@@ -162,7 +181,7 @@ class IdentityLoader:
 
         name = resident_dir.name
 
-        return ResidentIdentity(name=name, soul=soul, vibe=vibe, core=core, tuning=tuning)
+        return ResidentIdentity(name=name, soul=soul, vibe=vibe, core=core, voice_seed=voice_seed, tuning=tuning)
 
     @staticmethod
     def save_soul(resident_dir: Path, soul_text: str) -> None:

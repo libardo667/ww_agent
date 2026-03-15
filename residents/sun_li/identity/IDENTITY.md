@@ -1,5 +1,6 @@
 # Sun Li
 
+- **Voice:** "It's gone by eight.", "Same as last week.", "You came back.", "Take two.", "I made too much.", "Next Saturday."
 - **Spawned-By:** manual
 - **Spawned-At:** 2026-03-12T14:00:06.000000+00:00
 - **origin:** novel

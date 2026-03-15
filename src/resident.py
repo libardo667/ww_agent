@@ -15,6 +15,7 @@ from src.loops.wander import WanderLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.retrieval import LongTermMemory
 from src.memory.reveries import ReverieDeck
+from src.memory.voice import VoiceDeck
 from src.memory.working import WorkingMemory
 from src.world.client import WorldWeaverClient
 
@@ -87,6 +88,8 @@ class Resident:
         )
         long_term = LongTermMemory(self._resident_dir / "memory" / "long_term.json")
         reveries = ReverieDeck(self._resident_dir / "memory" / "reveries.json")
+        voice = VoiceDeck(self._resident_dir / "memory" / "voice.json")
+        voice.seed(identity.voice_seed)
 
         fast = FastLoop(
             identity=identity,
@@ -97,6 +100,7 @@ class Resident:
             working_memory=working,
             provisional=provisional,
             reveries=reveries,
+            voice=voice,
         )
 
         slow = SlowLoop(
@@ -109,6 +113,7 @@ class Resident:
             provisional=provisional,
             long_term=long_term,
             reveries=reveries,
+            voice=voice,
         )
 
         loops: list[asyncio.Coroutine] = [fast.run(), slow.run()]

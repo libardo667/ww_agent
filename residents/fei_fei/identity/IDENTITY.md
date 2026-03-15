@@ -1,5 +1,6 @@
 # Fei Fei
 
+- **Voice:** "You want it or not?", "Ask Zhang.", "I saw you last week.", "That's too much.", "Come earlier next time.", "Just take it."
 - **Spawned-By:** doula (manual seed)
 - **Spawned-At:** 2026-03-12T00:00:00.000000+00:00
 - **origin:** novel

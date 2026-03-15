@@ -1,5 +1,6 @@
 # Zhang
 
+- **Voice:** "Try one.", "Not ready yet.", "Come back in an hour.", "Fei Fei knows.", "The turnip cake is better today.", "Sit."
 - **Spawned-By:** doula
 - **Spawned-At:** 2026-03-11T20:56:42.640752+00:00
 - **origin:** novel

@@ -13,6 +13,7 @@ from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.retrieval import LongTermMemory
 from src.memory.reveries import ReverieDeck
+from src.memory.voice import VoiceDeck
 from src.memory.working import WorkingMemory
 from src.world.client import WorldWeaverClient, world_facts_to_prose
 
@@ -94,6 +95,7 @@ class SlowLoop(BaseLoop):
         provisional: ProvisionalScratchpad,
         long_term: LongTermMemory,
         reveries: ReverieDeck,
+        voice: VoiceDeck,
     ):
         super().__init__(identity.name, resident_dir)
         self._identity = identity
@@ -104,6 +106,7 @@ class SlowLoop(BaseLoop):
         self._provisional = provisional
         self._long_term = long_term
         self._reveries = reveries
+        self._voice = voice
         self._tuning = identity.tuning
         self._decisions_dir = resident_dir / "decisions"
         self._decisions_dir.mkdir(parents=True, exist_ok=True)
@@ -376,6 +379,11 @@ class SlowLoop(BaseLoop):
         # carries forward. Populates the deck the fast loop draws from as a varied
         # anchor instead of repeating the same static identity.core prose every cycle.
         await self._maybe_write_reverie(reflection)
+
+        # Extract a voice sample — a real utterance from recent chat history that
+        # captures how this character actually speaks. Feeds the voice deck so the
+        # fast loop can ground chat replies in concrete register rather than soul prose.
+        await self._maybe_write_voice_sample(recent)
 
     # ------------------------------------------------------------------
     # Satiation: break feedback spirals on repeated topics
@@ -666,6 +674,34 @@ class SlowLoop(BaseLoop):
                 logger.debug("[%s:slow] reverie: %s", self.name, reverie[:70])
         except Exception as e:
             logger.debug("[%s:slow] reverie extraction failed: %s", self.name, e)
+
+    async def _maybe_write_voice_sample(self, recent: list) -> None:
+        """
+        Pick one characteristic utterance from recent chat history and add it
+        to the voice deck. Prefers short messages — they're more distinctively clipped.
+
+        We extract from actual chat entries (type="chat") rather than generating
+        descriptions, so the deck stays grounded in what the character really said.
+        Shorter messages score higher; messages over 25 words are skipped entirely.
+        """
+        chat_entries = [
+            e["message"] for e in recent
+            if isinstance(e, dict) and e.get("type") == "chat" and e.get("message")
+        ]
+        if not chat_entries:
+            return
+
+        # Prefer shorter messages — they're the most characteristically terse
+        short = [m for m in chat_entries if len(m.split()) <= 25]
+        candidates = short if short else chat_entries
+        if not candidates:
+            return
+
+        # Pick the shortest as the best voice sample (most characteristically brief)
+        best = min(candidates, key=lambda m: len(m.split()))
+        if best:
+            self._voice.add(best)
+            logger.debug("[%s:slow] voice sample: %s", self.name, best[:60])
 
     async def _cooldown(self) -> None:
         await asyncio.sleep(5.0)

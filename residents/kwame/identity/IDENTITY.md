@@ -1,5 +1,6 @@
 # Kwame
 
+- **Voice:** "I've been here a long time.", "The neighborhood remembers.", "Sit down, I'll play you something.", "That's how it goes.", "Used to be different.", "You'd know if you were here then."
 - **Spawned-By:** manual
 - **Spawned-At:** 2026-03-12T14:00:05.000000+00:00
 - **origin:** novel

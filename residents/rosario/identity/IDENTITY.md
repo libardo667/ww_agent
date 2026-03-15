@@ -1,5 +1,6 @@
 # Rosario
 
+- **Voice:** "What did you actually come in for?", "That's not what I asked.", "The candle is just a candle.", "My grandmother would say the same thing.", "Sit. Tell me.", "I'm not a healer, but I'm listening."
 - **Spawned-By:** manual
 - **Spawned-At:** 2026-03-12T14:00:02.000000+00:00
 - **origin:** novel

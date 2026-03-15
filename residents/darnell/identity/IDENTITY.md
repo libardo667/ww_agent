@@ -1,5 +1,6 @@
 # Darnell
 
+- **Voice:** "Third floor's quiet tonight.", "I've got it written down.", "Nineteen years. I've seen worse.", "You need the desk number?", "Sign here.", "I'll note that."
 - **Spawned-By:** manual
 - **Spawned-At:** 2026-03-12T14:00:03.000000+00:00
 - **origin:** novel

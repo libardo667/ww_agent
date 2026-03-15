@@ -40,6 +40,7 @@ from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
 from src.memory.reveries import ReverieDeck
+from src.memory.voice import VoiceDeck
 from src.memory.working import WorkingMemory
 from src.world.client import WorldWeaverClient, ChatMessage
 
@@ -95,6 +96,7 @@ class FastLoop(BaseLoop):
         working_memory: WorkingMemory,
         provisional: ProvisionalScratchpad,
         reveries: ReverieDeck,
+        voice: VoiceDeck,
     ):
         super().__init__(identity.name, resident_dir)
         self._identity = identity
@@ -104,6 +106,7 @@ class FastLoop(BaseLoop):
         self._working = working_memory
         self._provisional = provisional
         self._reveries = reveries
+        self._voice = voice
         self._tuning = identity.tuning
         self._last_event_ts: str = datetime.now(timezone.utc).isoformat()
         self._last_chat_ts: str = datetime.now(timezone.utc).isoformat()
@@ -395,9 +398,16 @@ class FastLoop(BaseLoop):
             react_temperature = min(1.0, react_temperature + 0.1)
             react_max_tokens = min(react_max_tokens, 80)
 
+        # Use voice-grounded system prompt when chat is present so the character
+        # speaks in their own register rather than bleeding inner-soul prose into speech.
+        if chat_context:
+            system_prompt = self._identity.soul_with_voice(self._voice.sample(4))
+        else:
+            system_prompt = self._identity.soul_with_context
+
         try:
             response = await self._llm.complete(
-                system_prompt=self._identity.soul_with_context,
+                system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=self._tuning.fast_model,
                 temperature=react_temperature,

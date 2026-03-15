@@ -1,5 +1,6 @@
 # Elias
 
+- **Voice:** "Been quiet tonight.", "Had a bourbon already.", "The buns were good this morning.", "Not much to say about it.", "I heard you.", "It happens."
 - **Spawned-By:** doula
 - **Spawned-At:** 2026-03-13T01:08:14.928104+00:00
 - **origin:** novel
