@@ -11,6 +11,7 @@ from src.identity.loader import ResidentIdentity
 from src.inference.client import InferenceClient
 from src.loops.base import BaseLoop
 from src.memory.provisional import ProvisionalScratchpad
+from src.memory.research_queue import ResearchQueue
 from src.memory.retrieval import LongTermMemory
 from src.memory.reveries import ReverieDeck
 from src.memory.voice import VoiceDeck
@@ -96,6 +97,7 @@ class SlowLoop(BaseLoop):
         long_term: LongTermMemory,
         reveries: ReverieDeck,
         voice: VoiceDeck,
+        research_queue: ResearchQueue | None = None,
     ):
         super().__init__(identity.name, resident_dir)
         self._identity = identity
@@ -107,6 +109,7 @@ class SlowLoop(BaseLoop):
         self._long_term = long_term
         self._reveries = reveries
         self._voice = voice
+        self._research_queue = research_queue
         self._tuning = identity.tuning
         self._decisions_dir = resident_dir / "decisions"
         self._decisions_dir.mkdir(parents=True, exist_ok=True)
@@ -384,6 +387,11 @@ class SlowLoop(BaseLoop):
         # captures how this character actually speaks. Feeds the voice deck so the
         # fast loop can ground chat replies in concrete register rather than soul prose.
         await self._maybe_write_voice_sample(recent)
+
+        # Extract research curiosities — things the reflection surfaced that the
+        # agent genuinely doesn't know. The ground loop fetches answers and writes
+        # them to working memory for the next fast loop cycle.
+        await self._maybe_extract_research(reflection)
 
     # ------------------------------------------------------------------
     # Satiation: break feedback spirals on repeated topics
@@ -702,6 +710,39 @@ class SlowLoop(BaseLoop):
         if best:
             self._voice.add(best)
             logger.debug("[%s:slow] voice sample: %s", self.name, best[:60])
+
+    async def _maybe_extract_research(self, reflection: str) -> None:
+        """
+        Extract 0-2 specific, searchable queries from the reflection and add
+        them to the research queue. The ground loop fetches answers and writes
+        them to working memory so the next fast loop cycle sees the result.
+        """
+        if self._research_queue is None:
+            return
+        try:
+            raw = await self._llm.complete(
+                system_prompt=(
+                    f"You are reading {self.name}'s private reflection. "
+                    "Identify 0-2 things they genuinely don't know but could look up — "
+                    "specific, searchable questions about the real world. "
+                    "Write each as a short search query (5-80 characters). "
+                    "Format each on its own line as: RESEARCH: <query>\n"
+                    "If there is nothing worth looking up, reply with exactly: nothing"
+                ),
+                user_prompt=reflection[:800],
+                model=self._tuning.slow_subconscious_model,
+                temperature=0.5,
+                max_tokens=80,
+            )
+            for line in raw.splitlines():
+                line = line.strip()
+                if line.lower().startswith("research:"):
+                    query = line[len("research:"):].strip()
+                    if 5 <= len(query) <= 80:
+                        self._research_queue.add(query, priority="normal", source="slow_reflection")
+                        logger.debug("[%s:slow] research queued: %s", self.name, query)
+        except Exception as e:
+            logger.debug("[%s:slow] research extraction failed: %s", self.name, e)
 
     async def _cooldown(self) -> None:
         await asyncio.sleep(5.0)

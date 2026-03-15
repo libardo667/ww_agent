@@ -13,6 +13,7 @@ from src.loops.mail import MailLoop
 from src.loops.slow import SlowLoop
 from src.loops.wander import WanderLoop
 from src.memory.provisional import ProvisionalScratchpad
+from src.memory.research_queue import ResearchQueue
 from src.memory.retrieval import LongTermMemory
 from src.memory.reveries import ReverieDeck
 from src.memory.voice import VoiceDeck
@@ -90,6 +91,7 @@ class Resident:
         reveries = ReverieDeck(self._resident_dir / "memory" / "reveries.json")
         voice = VoiceDeck(self._resident_dir / "memory" / "voice.json")
         voice.seed(identity.voice_seed)
+        research_queue = ResearchQueue(self._resident_dir / "memory" / "research_queue.json")
 
         fast = FastLoop(
             identity=identity,
@@ -114,6 +116,7 @@ class Resident:
             long_term=long_term,
             reveries=reveries,
             voice=voice,
+            research_queue=research_queue,
         )
 
         loops: list[asyncio.Coroutine] = [fast.run(), slow.run()]
@@ -136,6 +139,7 @@ class Resident:
                 llm=self._llm,
                 session_id=session_id,
                 working_memory=working,
+                research_queue=research_queue,
             )
             loops.append(ground.run())
 
